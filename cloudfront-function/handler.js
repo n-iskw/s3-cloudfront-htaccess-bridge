@@ -1,4 +1,5 @@
 import cf from 'cloudfront';
+import crypto from 'crypto';
 
 var kvs = cf.kvs();
 var KVS_KEY_REDIRECTS_META = 'htaccess-redirects-meta';
@@ -119,12 +120,31 @@ function isAuthorized(event, request, maintenance) {
   if (isAllowedViewerIp(event, maintenance.allowIps || [])) {
     return true;
   }
-  if (!maintenance.authorization) {
-    return false;
-  }
   var headers = request.headers || {};
   var auth = headers.authorization && headers.authorization.value;
-  return auth === maintenance.authorization;
+  if (!auth || auth.substring(0, 6).toLowerCase() !== 'basic ') {
+    return false;
+  }
+  var decoded;
+  try {
+    decoded = Buffer.from(auth.substring(6), 'base64').toString('utf8');
+  } catch (e) {
+    return false;
+  }
+  var separator = decoded.indexOf(':');
+  if (separator < 1) {
+    return false;
+  }
+  var username = decoded.substring(0, separator);
+  var password = decoded.substring(separator + 1);
+  var digest = crypto.createHash('sha1').update(password).digest('base64');
+  var credentials = maintenance.credentials || [];
+  for (var i = 0; i < credentials.length; i++) {
+    if (credentials[i].username === username && credentials[i].sha1 === digest) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function isAllowedViewerIp(event, allowIps) {

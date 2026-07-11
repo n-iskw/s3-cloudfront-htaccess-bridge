@@ -20,8 +20,23 @@ Basic 認証を有効にする例:
 ```apache
 AuthType Basic
 AuthName "Maintenance"
+AuthUserFile .htpasswd
 Require valid-user
 ```
+
+同じディレクトリに置く `.htpasswd` を作成してアップロードします。対応するのは `{SHA}` 形式です。
+
+```bash
+htpasswd -cs .htpasswd preview
+```
+
+既存ファイルへユーザーを追加・更新する場合は `-c` を外します。
+
+```bash
+htpasswd -s .htpasswd preview
+```
+
+`.htaccess` と `.htpasswd` はどちらを先にアップロードしても構いません。認証を有効にした `.htaccess` だけが存在する間は設定が rejected になりますが、`.htpasswd` が揃った時点で自動的に反映されます。bcrypt、Apache MD5、crypt形式は非対応です。
 
 特定の確認用 IP アドレスだけ Basic 認証を通過させる例:
 
@@ -122,8 +137,17 @@ Enable Basic authentication:
 ```apache
 AuthType Basic
 AuthName "Maintenance"
+AuthUserFile .htpasswd
 Require valid-user
 ```
+
+Create and upload `.htpasswd` in the same directory. Only the `{SHA}` format is supported:
+
+```bash
+htpasswd -cs .htpasswd preview
+```
+
+Remove `-c` when adding or updating a user in an existing file. Upload order does not matter; the configuration is published when both files are present. bcrypt, Apache MD5, and crypt hashes are not supported.
 
 Allow specific review IP addresses to bypass Basic authentication:
 

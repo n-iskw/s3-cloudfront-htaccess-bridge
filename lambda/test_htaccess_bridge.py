@@ -1,10 +1,28 @@
 import json
 import unittest
 
-from htaccess_bridge import HtaccessError, build_site_config, parse_htaccess
+from htaccess_bridge import HtaccessError, build_site_config, parse_htaccess, parse_htpasswd
 
 
 class HtaccessBridgeTests(unittest.TestCase):
+    def test_parses_sha1_htpasswd(self):
+        self.assertEqual(
+            parse_htpasswd("user:{SHA}nU4eI71bcnBGqeO0t9tXvY1u5oQ="),
+            [{"username": "user", "sha1": "nU4eI71bcnBGqeO0t9tXvY1u5oQ="}],
+        )
+
+    def test_rejects_unsupported_htpasswd_hash(self):
+        with self.assertRaisesRegex(HtaccessError, "only Apache SHA-1"):
+            parse_htpasswd("user:$2y$05$abcdefghijklmnopqrstuuuuuuuuuuuuuuuuuuuuuuuuuuu")
+
+    def test_auth_user_file_must_be_same_directory_htpasswd(self):
+        config = parse_htaccess(
+            "AuthType Basic\nAuthName Maintenance\nAuthUserFile .htpasswd\nRequire valid-user"
+        )
+        self.assertEqual(config["maintenance"]["authUserFile"], ".htpasswd")
+        with self.assertRaisesRegex(HtaccessError, "must be .htpasswd"):
+            parse_htaccess("AuthUserFile /etc/apache2/.htpasswd")
+
     def test_parses_basic_auth_and_redirects(self):
         config = parse_htaccess(
             """
@@ -207,6 +225,22 @@ class HtaccessBridgeTests(unittest.TestCase):
         self.assertEqual(config["authScopes"][1]["pathPrefix"], "/")
         self.assertEqual(config["redirects"][0]["basePath"], "/members/")
         self.assertEqual(config["redirects"][1]["from"], "/old/")
+
+    def test_builds_auth_scope_with_same_directory_htpasswd(self):
+        config = build_site_config(
+            [("members/.htaccess", "AuthType Basic\nRequire valid-user")],
+            htpasswd_files={
+                "members/.htpasswd": "user:{SHA}nU4eI71bcnBGqeO0t9tXvY1u5oQ="
+            },
+        )
+        self.assertEqual(config["authScopes"][0]["credentials"][0]["username"], "user")
+
+    def test_ignores_unreferenced_htpasswd(self):
+        config = build_site_config(
+            [(".htaccess", "Redirect 302 /old/ /new/")],
+            htpasswd_files={"unused/.htpasswd": "not-a-valid-record"},
+        )
+        self.assertEqual(config["authScopes"], [])
 
     def test_builds_empty_site_config_when_all_htaccess_files_are_deleted(self):
         config = build_site_config([])

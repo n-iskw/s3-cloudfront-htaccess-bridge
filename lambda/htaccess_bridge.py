@@ -1,4 +1,3 @@
-import base64
 import datetime as dt
 import hashlib
 import json
@@ -19,6 +18,7 @@ KVS_PUBLISH_BASE_DELAY_SECONDS = 0.2
 SUPPORTED_DIRECTIVES = {
     "authtype",
     "authname",
+    "authuserfile",
     "require",
     "redirect",
     "redirectpermanent",
@@ -67,6 +67,7 @@ def parse_htaccess(
     rewrite_engine_on = False
     directory_index: List[str] = []
     directory_index_disabled = False
+    auth_user_file: Optional[str] = None
 
     for line in parsed_lines:
         name = line.directive
@@ -84,6 +85,14 @@ def parse_htaccess(
         elif name == "authname":
             _expect_arg_count(line, 1)
             maintenance["realm"] = args[0]
+
+        elif name == "authuserfile":
+            _expect_arg_count(line, 1)
+            if args[0] != ".htpasswd":
+                raise HtaccessError(
+                    f"line {line.line_no}: AuthUserFile must be .htpasswd in the same S3 directory"
+                )
+            auth_user_file = args[0]
 
         elif name == "require":
             if len(args) == 1 and args[0].lower() == "valid-user":
@@ -120,6 +129,8 @@ def parse_htaccess(
             )
 
     maintenance["enabled"] = auth_type_basic and require_valid_user
+    if maintenance["enabled"]:
+        maintenance["authUserFile"] = auth_user_file or ".htpasswd"
 
     config = {
         "schemaVersion": 1,
@@ -132,25 +143,56 @@ def parse_htaccess(
     return config
 
 
-def enrich_config(config: Dict[str, Any], *, basic_auth_value: Optional[str] = None) -> Dict[str, Any]:
-    enriched = json.loads(json.dumps(config, separators=(",", ":")))
-    if basic_auth_value:
-        enriched["maintenance"]["authorization"] = basic_auth_value
-        for scope in enriched.get("authScopes", []):
-            if scope.get("enabled"):
-                scope["authorization"] = basic_auth_value
-    return enriched
+def parse_htpasswd(text: str, *, source_key: str = ".htpasswd") -> List[Dict[str, str]]:
+    """Parse the SHA-1 format emitted by ``htpasswd -s``.
+
+    CloudFront Functions can verify SHA-1 with its built-in crypto module.
+    Salted Apache MD5, bcrypt, and crypt formats are intentionally rejected.
+    """
+    credentials: List[Dict[str, str]] = []
+    seen = set()
+    for line_no, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if ":" not in line:
+            raise HtaccessError(f"{source_key} line {line_no}: expected username:password-hash")
+        username, password_hash = line.split(":", 1)
+        if not username or len(username.encode("utf-8")) > 255 or ":" in username:
+            raise HtaccessError(f"{source_key} line {line_no}: invalid username")
+        if username in seen:
+            raise HtaccessError(f"{source_key} line {line_no}: duplicate username: {username}")
+        if not re.fullmatch(r"\{SHA\}[A-Za-z0-9+/]{27}=", password_hash):
+            raise HtaccessError(
+                f"{source_key} line {line_no}: only Apache SHA-1 {{SHA}} hashes are supported; create them with htpasswd -s"
+            )
+        seen.add(username)
+        credentials.append({"username": username, "sha1": password_hash[5:]})
+    if not credentials:
+        raise HtaccessError(f"{source_key}: no credentials found")
+    return credentials
 
 
 def build_site_config(
     files: List[Tuple[str, str]],
     *,
     allowed_external_hosts: Optional[Iterable[str]] = None,
+    htpasswd_files: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     parsed_files = []
     for key, text in files:
         parsed = parse_htaccess(text, allowed_external_hosts=allowed_external_hosts, source_key=key)
         parsed_files.append((key, _base_path_for_htaccess(key), parsed))
+    required_htpasswd_keys = {
+        _htpasswd_key_for_scope(key)
+        for key, _base_path, parsed in parsed_files
+        if parsed["maintenance"]["enabled"]
+    }
+    parsed_htpasswd_files = {
+        key: parse_htpasswd((htpasswd_files or {})[key], source_key=key)
+        for key in required_htpasswd_keys
+        if key in (htpasswd_files or {})
+    }
 
     redirects = []
     auth_scopes = []
@@ -160,6 +202,7 @@ def build_site_config(
     for key, base_path, parsed in sorted(parsed_files, key=lambda item: (item[1].count("/"), item[1])):
         maintenance = parsed["maintenance"]
         if maintenance["enabled"]:
+            passwd_key = _htpasswd_key_for_scope(key)
             scope = {
                 "pathPrefix": base_path,
                 "enabled": True,
@@ -167,6 +210,8 @@ def build_site_config(
                 "allowIps": maintenance.get("allowIps", []),
                 "sourceKey": key,
             }
+            if passwd_key in parsed_htpasswd_files:
+                scope["credentials"] = parsed_htpasswd_files[passwd_key]
             auth_scopes.append(scope)
             if base_path == "/":
                 root_maintenance = {
@@ -174,6 +219,8 @@ def build_site_config(
                     "realm": maintenance.get("realm", "Maintenance"),
                     "allowIps": maintenance.get("allowIps", []),
                 }
+                if passwd_key in parsed_htpasswd_files:
+                    root_maintenance["credentials"] = parsed_htpasswd_files[passwd_key]
 
         if parsed.get("directoryIndex"):
             directory_index_scopes.append(
@@ -244,33 +291,42 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     rules_suffix = os.environ.get("RULES_SUFFIX", ".htaccess")
     history_prefix = os.environ.get("HISTORY_PREFIX", "_control-history").strip("/")
     allowed_hosts = _split_csv(os.environ.get("ALLOWED_EXTERNAL_HOSTS", ""))
-    basic_secret_id = os.environ.get("BASIC_AUTH_SECRET_ID")
 
     results = []
     for record in event.get("Records", []):
         bucket = record["s3"]["bucket"]["name"]
         key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
-        if not _is_rules_key(key, rules_key, rules_suffix):
+        if not (_is_rules_key(key, rules_key, rules_suffix) or key == ".htpasswd" or key.endswith("/.htpasswd")):
             _log_event("skipped", bucket=bucket, key=key)
             results.append({"bucket": bucket, "key": key, "status": "skipped"})
             continue
 
         files = _load_all_htaccess_files(s3, bucket, rules_key, rules_suffix)
+        htpasswd_files = _load_all_htpasswd_files(s3, bucket)
         source_hash = hashlib.sha256(
-            "\n".join(f"{file_key}:{hashlib.sha256(body.encode('utf-8')).hexdigest()}" for file_key, body in files).encode(
-                "utf-8"
-            )
+            (
+                "\n".join(
+                    f"{file_key}:{hashlib.sha256(body.encode('utf-8')).hexdigest()}"
+                    for file_key, body in files
+                )
+                + "\nhtpasswd:"
+                + hashlib.sha256(_json_dumps(htpasswd_files).encode("utf-8")).hexdigest()
+            ).encode("utf-8")
         ).hexdigest()
         timestamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
         try:
-            config = build_site_config(files, allowed_external_hosts=allowed_hosts)
-            basic_auth_value = _load_basic_auth_value(basic_secret_id)
-            if _has_enabled_auth(config) and not basic_auth_value:
-                raise HtaccessError("maintenance is enabled but BASIC_AUTH_SECRET_ID is not configured")
-            config = enrich_config(config, basic_auth_value=basic_auth_value)
+            config = build_site_config(
+                files,
+                allowed_external_hosts=allowed_hosts,
+                htpasswd_files=htpasswd_files,
+            )
+            if _has_enabled_auth(config) and not _all_auth_scopes_have_credentials(config):
+                raise HtaccessError(
+                    "maintenance is enabled but the matching .htpasswd is missing"
+                )
             puts = split_config_for_kvs(config)
-            payload = _json_dumps(config)
+            payload = _json_dumps(_redact_credentials(config))
 
             _publish_to_kvs(puts)
             history_key = f"{history_prefix}/published/{timestamp}-{source_hash[:12]}.json"
@@ -579,7 +635,7 @@ def split_config_for_kvs(config: Dict[str, Any]) -> Dict[str, str]:
     time (confirmed in practice: 10 DirectoryIndex-only .htaccess files
     alone exceeded the 1 KB single-key limit), so a fixed single-key layout
     is not safe for any of them. Maintenance mode config (at most one
-    enabled/realm/allowIps/authorization object site-wide) remains a single
+    enabled/realm/allowIps/credentials object site-wide) remains a single
     key since it cannot grow with the number of .htaccess files.
     """
     chunk_groups = {
@@ -729,6 +785,12 @@ def _base_path_for_htaccess(key: str) -> str:
     raise HtaccessError(f"not an htaccess key: {key}")
 
 
+def _htpasswd_key_for_scope(htaccess_key: str) -> str:
+    if htaccess_key == ".htaccess":
+        return ".htpasswd"
+    return htaccess_key[: -len(".htaccess")] + ".htpasswd"
+
+
 def _rule_specificity(rule: Dict[str, Any]) -> int:
     if rule.get("type") == "redirect":
         return len(rule.get("from", ""))
@@ -739,6 +801,19 @@ def _has_enabled_auth(config: Dict[str, Any]) -> bool:
     if config.get("maintenance", {}).get("enabled"):
         return True
     return any(scope.get("enabled") for scope in config.get("authScopes", []))
+
+
+def _all_auth_scopes_have_credentials(config: Dict[str, Any]) -> bool:
+    scopes = [scope for scope in config.get("authScopes", []) if scope.get("enabled")]
+    return bool(scopes) and all(scope.get("credentials") for scope in scopes)
+
+
+def _redact_credentials(config: Dict[str, Any]) -> Dict[str, Any]:
+    redacted = json.loads(json.dumps(config, separators=(",", ":")))
+    redacted.get("maintenance", {}).pop("credentials", None)
+    for scope in redacted.get("authScopes", []):
+        scope.pop("credentials", None)
+    return redacted
 
 
 def _is_rules_key(key: str, exact_key: Optional[str], suffix: str) -> bool:
@@ -772,20 +847,23 @@ def _load_all_htaccess_files(s3: Any, bucket: str, exact_key: Optional[str], suf
     return files
 
 
-def _load_basic_auth_value(secret_id: Optional[str]) -> Optional[str]:
-    if not secret_id:
-        return None
-    sm = _boto3_client("secretsmanager")
-    raw_secret = sm.get_secret_value(SecretId=secret_id)["SecretString"]
-    secret = json.loads(raw_secret)
-    if "authorization" in secret:
-        return secret["authorization"]
-    username = secret.get("username")
-    password = secret.get("password")
-    if not username or not password:
-        raise HtaccessError("Basic auth secret must contain authorization or username/password")
-    encoded = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-    return f"Basic {encoded}"
+def _load_all_htpasswd_files(s3: Any, bucket: str) -> Dict[str, str]:
+    files: Dict[str, str] = {}
+    continuation_token = None
+    while True:
+        kwargs = {"Bucket": bucket}
+        if continuation_token:
+            kwargs["ContinuationToken"] = continuation_token
+        response = s3.list_objects_v2(**kwargs)
+        for item in response.get("Contents", []):
+            key = item["Key"]
+            if key == ".htpasswd" or key.endswith("/.htpasswd"):
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read().decode("utf-8")
+                files[key] = body
+        if not response.get("IsTruncated"):
+            break
+        continuation_token = response.get("NextContinuationToken")
+    return files
 
 
 def _publish_to_kvs(puts: Dict[str, str]) -> None:

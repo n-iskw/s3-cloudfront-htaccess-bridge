@@ -5,6 +5,35 @@
 // duplicating the pure logic here. We duplicate here to keep this test
 // dependency-free and avoid parsing the ES module import.
 
+var crypto = require('crypto');
+
+function isAuthorizedWithCredentials(auth, credentials) {
+  if (!auth || auth.substring(0, 6).toLowerCase() !== 'basic ') return false;
+  var decoded;
+  try {
+    decoded = Buffer.from(auth.substring(6), 'base64').toString('utf8');
+  } catch (e) {
+    return false;
+  }
+  var separator = decoded.indexOf(':');
+  if (separator < 1) return false;
+  var username = decoded.substring(0, separator);
+  var password = decoded.substring(separator + 1);
+  var digest = crypto.createHash('sha1').update(password).digest('base64');
+  for (var i = 0; i < credentials.length; i++) {
+    if (credentials[i].username === username && credentials[i].sha1 === digest) return true;
+  }
+  return false;
+}
+
+var credential = { username: 'preview', sha1: 'nU4eI71bcnBGqeO0t9tXvY1u5oQ=' };
+if (!isAuthorizedWithCredentials('Basic ' + Buffer.from('preview:pass').toString('base64'), [credential])) {
+  throw new Error('expected SHA-1 htpasswd credential to authorize');
+}
+if (isAuthorizedWithCredentials('Basic ' + Buffer.from('preview:wrong').toString('base64'), [credential])) {
+  throw new Error('expected wrong password to be rejected');
+}
+
 function hasFileExtension(uri) {
   var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
   var lastDotIndex = lastSegment.lastIndexOf('.');

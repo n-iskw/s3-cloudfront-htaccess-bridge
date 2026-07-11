@@ -16,6 +16,19 @@
 
 このプロジェクトが追加するのは、リダイレクト・Basic 認証メンテナンスモード・DirectoryIndex を実現するための KVS・Lambda・CloudFront Functions の関数・S3 イベント通知だけです。既存の S3 バケット・CloudFront Distribution 自体は新規作成しません。既存バケットの設定（暗号化・バージョニング・パブリックアクセスブロック等）や、既存 Distribution の他の設定（他の Cache Behavior、オリジン設定等）も変更しません。
 
+### 既存IaC製品へ統合する場合
+
+既存環境がCDK、TerraformなどのIaCで管理されている場合、`infra/integration-addon.yaml`を別スタックとしてそのままデプロイすることは推奨しません。このテンプレートは、既存のS3通知設定を置換するカスタムリソースを含むためです。また、同じCache Behaviorの`viewer-request`には複数のCloudFront Functionsの関数を関連付けられません。
+
+その場合は、このリポジトリを仕様・ロジックのリファレンスとして利用し、次を既存IaCへ移植してください。
+
+- `lambda/htaccess_bridge.py`と、その約21MBの依存関係を含むLambdaパッケージ
+- CloudFront KeyValueStoreとLambdaのIAM権限
+- `.htaccess`と`.htpasswd`のS3イベント通知（既存IaCのbucket notification APIで追加）
+- `cloudfront-function/handler.js`の処理（既存の`viewer-request` Function生成ロジックへ統合）
+
+`infra/integration-addon.yaml`は、既存のS3通知や`viewer-request` Functionがない単純な環境での検証・導入例として位置付けます。
+
 新規に S3 バケットと CloudFront Distribution を両方作る場合は `infra/standalone.yaml` を使います。既存環境への組み込みでは、下記の `infra/integration-addon.yaml` を使います。
 
 ### 使うテンプレート: `infra/integration-addon.yaml`
@@ -60,17 +73,7 @@ aws cloudformation wait stack-create-complete \
   --region us-east-1
 ```
 
-Basic 認証（メンテナンスモード）を使う場合は、事前に Secrets Manager にシークレットを作成し、`BasicAuthSecretId` パラメータを追加します。
-
-```bash
-aws secretsmanager create-secret \
-  --name htaccess-bridge-basic-auth \
-  --secret-string '{"username":"user","password":"pass"}' \
-  --region us-east-1
-
-# create-stack のパラメータに以下を追加
-#   ParameterKey=BasicAuthSecretId,ParameterValue=htaccess-bridge-basic-auth
-```
+Basic 認証（メンテナンスモード）の認証情報は、コンテンツと一緒に `.htpasswd`（`htpasswd -s` の `{SHA}` 形式）としてアップロードします。
 
 この時点では、Lambda関数はプレースホルダーコード（呼ばれるとエラーを返すだけ）で作成されています。まだ`.htaccess`をアップロードしても正しく動作しません。
 
@@ -194,7 +197,7 @@ aws cloudformation delete-stack \
   --region us-east-1
 ```
 
-このスタックの削除前に、手順5で追加した `FunctionAssociations` を既存 Distribution から先に取り除いてください（`CloudFront Functions の関数` リソースが削除された後も Distribution 側に参照が残っていると、次回のデプロイやトラブルシューティングで混乱の元になります）。
+このスタックの削除前に、手順4で追加した `FunctionAssociations` を既存 Distribution から先に取り除いてください（`CloudFront Functions の関数` リソースが削除された後も Distribution 側に参照が残っていると、次回のデプロイやトラブルシューティングで混乱の元になります）。
 
 ---
 
@@ -208,6 +211,19 @@ This guide assumes both of the following already exist:
 - A CloudFront Distribution using that bucket as its origin
 
 This project only adds the KVS, Lambda, the function in CloudFront Functions, and S3 event notification needed for redirects, Basic-auth maintenance mode, and DirectoryIndex. It does not create your S3 bucket or CloudFront Distribution. It does not modify your existing bucket settings (encryption, versioning, public access block, etc.) or other parts of your existing Distribution (other cache behaviors, origins, etc.).
+
+### Integrating into an existing IaC-managed product
+
+If the existing environment is managed by CDK, Terraform, or another IaC system, do not deploy `infra/integration-addon.yaml` unchanged as a separate stack. Its custom resource replaces the bucket's S3 notification configuration, and a cache behavior cannot associate multiple functions in CloudFront Functions with the same `viewer-request` event.
+
+Use this repository as a specification and logic reference, and port the following into the existing IaC:
+
+- `lambda/htaccess_bridge.py` and its approximately 21 MB Lambda package with dependencies
+- The CloudFront KeyValueStore and Lambda IAM permissions
+- `.htaccess` and `.htpasswd` S3 event notifications, added through the existing IaC's bucket notification API
+- The logic from `cloudfront-function/handler.js`, merged into the existing `viewer-request` function generator
+
+Treat `infra/integration-addon.yaml` as a validation and deployment example for simple environments that have no existing S3 notifications or `viewer-request` function.
 
 Use `infra/standalone.yaml` to create both a new S3 bucket and a new CloudFront Distribution. For an existing environment, use `infra/integration-addon.yaml` below instead.
 
@@ -253,17 +269,7 @@ aws cloudformation wait stack-create-complete \
   --region us-east-1
 ```
 
-If you use Basic auth (maintenance mode), create a Secrets Manager secret first and add the `BasicAuthSecretId` parameter.
-
-```bash
-aws secretsmanager create-secret \
-  --name htaccess-bridge-basic-auth \
-  --secret-string '{"username":"user","password":"pass"}' \
-  --region us-east-1
-
-# add this to the create-stack parameters
-#   ParameterKey=BasicAuthSecretId,ParameterValue=htaccess-bridge-basic-auth
-```
+Basic auth credentials are uploaded with the content as `.htpasswd` in the `{SHA}` format produced by `htpasswd -s`.
 
 At this point the Lambda function exists with placeholder code only (it raises an error if invoked). Uploading a `.htaccess` file will not work correctly yet.
 
@@ -291,18 +297,6 @@ If your dependencies ever exceed 50MB (not the case here), you would need to dep
 #### 3. Retrieve stack outputs
 
 ```bash
-aws secretsmanager create-secret \
-  --name htaccess-bridge-basic-auth \
-  --secret-string '{"username":"user","password":"pass"}' \
-  --region us-east-1
-
-# add this to the create-stack parameters
-#   ParameterKey=BasicAuthSecretId,ParameterValue=htaccess-bridge-basic-auth
-```
-
-#### 4. Retrieve stack outputs
-
-```bash
 aws cloudformation describe-stacks \
   --stack-name htaccess-bridge-integration \
   --region us-east-1 \
@@ -311,7 +305,7 @@ aws cloudformation describe-stacks \
 
 Note the `CloudFrontFunctionArn` value for the next step.
 
-#### 5. Attach the function in CloudFront Functions to your existing Distribution
+#### 4. Attach the function in CloudFront Functions to your existing Distribution
 
 This template does not modify your existing Distribution. Attach it manually (or via your own IaC) as follows.
 
@@ -349,7 +343,7 @@ aws cloudfront update-distribution \
   --if-match "the ETag value from the previous step"
 ```
 
-#### 6. Upload a `.htaccess` and verify the auto-trigger
+#### 5. Upload a `.htaccess` and verify the auto-trigger
 
 ```bash
 aws s3 cp examples/.htaccess s3://YOUR-EXISTING-CONTENT-BUCKET/.htaccess
@@ -398,4 +392,4 @@ aws cloudformation delete-stack \
   --region us-east-1
 ```
 
-Before deleting this stack, remove the `FunctionAssociations` entry you added in step 5 from your existing Distribution (leaving a reference to a deleted function in CloudFront Functions on your Distribution will cause confusion in future deployments or troubleshooting).
+Before deleting this stack, remove the `FunctionAssociations` entry you added in step 4 from your existing Distribution (leaving a reference to a deleted function in CloudFront Functions on your Distribution will cause confusion in future deployments or troubleshooting).

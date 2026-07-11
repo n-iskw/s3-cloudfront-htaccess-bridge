@@ -14,14 +14,6 @@ Parameters:
   ContentBucketName:
     Type: String
     Description: "Name of your EXISTING site content bucket (not created by this template)."
-  BasicAuthSecretId:
-    Type: String
-    Default: ""
-    Description: "Optional Secrets Manager secret name/ARN for Basic auth credential. Leave empty if maintenance mode is not used."
-
-Conditions:
-  HasBasicAuthSecret: !Not [!Equals [!Ref BasicAuthSecretId, ""]]
-
 Resources:
   HtaccessConfigStore:
     Type: AWS::CloudFront::KeyValueStore
@@ -60,14 +52,6 @@ Resources:
               - logs:CreateLogStream
               - logs:PutLogEvents
             Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-fn*"
-          - !If
-            - HasBasicAuthSecret
-            - Sid: SecretsManagerBasicAuthAccess
-              Effect: Allow
-              Action:
-                - secretsmanager:GetSecretValue
-              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${BasicAuthSecretId}*"
-            - !Ref AWS::NoValue
 
   HtaccessBridgeExecutionRole:
     Type: AWS::IAM::Role
@@ -109,7 +93,6 @@ Resources:
         Variables:
           KVS_ARN: !GetAtt HtaccessConfigStore.Arn
           HISTORY_PREFIX: _control-history
-          BASIC_AUTH_SECRET_ID: !If [HasBasicAuthSecret, !Ref BasicAuthSecretId, !Ref "AWS::NoValue"]
 
   HtaccessBridgeLogGroup:
     Type: AWS::Logs::LogGroup
@@ -235,6 +218,16 @@ Resources:
                                       }
                                   },
                               },
+                              {
+                                  "LambdaFunctionArn": lambda_arn,
+                                  "Events": ["s3:ObjectCreated:*"],
+                                  "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": ".htpasswd"}]}},
+                              },
+                              {
+                                  "LambdaFunctionArn": lambda_arn,
+                                  "Events": ["s3:ObjectRemoved:*"],
+                                  "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": ".htpasswd"}]}},
+                              },
                           ]
                       }
                       s3.put_bucket_notification_configuration(
@@ -277,6 +270,7 @@ Resources:
       AutoPublish: true
       FunctionCode: |
         import cf from 'cloudfront';
+        import crypto from 'crypto';
         var kvs = cf.kvs();
         var KVS_KEY_REDIRECTS_META = 'htaccess-redirects-meta';
         var KVS_KEY_REDIRECTS_CHUNK_PREFIX = 'htaccess-redirects-';
@@ -380,12 +374,31 @@ Resources:
           if (isAllowedViewerIp(event, maintenance.allowIps || [])) {
             return true;
           }
-          if (!maintenance.authorization) {
-            return false;
-          }
           var headers = request.headers || {};
           var auth = headers.authorization && headers.authorization.value;
-          return auth === maintenance.authorization;
+          if (!auth || auth.substring(0, 6).toLowerCase() !== 'basic ') {
+            return false;
+          }
+          var decoded;
+          try {
+            decoded = Buffer.from(auth.substring(6), 'base64').toString('utf8');
+          } catch (e) {
+            return false;
+          }
+          var separator = decoded.indexOf(':');
+          if (separator < 1) {
+            return false;
+          }
+          var username = decoded.substring(0, separator);
+          var password = decoded.substring(separator + 1);
+          var digest = crypto.createHash('sha1').update(password).digest('base64');
+          var credentials = maintenance.credentials || [];
+          for (var i = 0; i < credentials.length; i++) {
+            if (credentials[i].username === username && credentials[i].sha1 === digest) {
+              return true;
+            }
+          }
+          return false;
         }
 
         function isAllowedViewerIp(event, allowIps) {

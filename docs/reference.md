@@ -93,7 +93,7 @@ Lambda ZIP のビルド:
 
 1. `lambda/htaccess_bridge.py` を Lambda 関数としてデプロイします。
 2. CloudFront KeyValueStore を作成し、ARN を `KVS_ARN` に設定します。
-3. Basic 認証の認証情報を Secrets Manager に保存し、`BASIC_AUTH_SECRET_ID` に設定します。
+3. Basic 認証を使う場合は、`htpasswd -s` で `.htpasswd` を作成します。
 4. S3 Event Notification で `.htaccess` の作成・更新・削除イベントを Lambda に送ります。
 5. 既存の index document routing 用 CloudFront Functions 関数コードに `cloudfront-function/handler.js` の処理順序を統合します。
 6. 任意の S3 アップロードクライアントで `examples/.htaccess` を S3 バケットにアップロードします。
@@ -114,6 +114,7 @@ maintenance ON   -> Basic auth, except allowed IPs
 ```apache
 AuthType Basic
 AuthName "Maintenance"
+AuthUserFile .htpasswd
 Require valid-user
 Require ip 203.0.113.10 198.51.100.0/24
 
@@ -165,9 +166,9 @@ RewriteRule ^old/(.*)$ /new/$1 [R=301,L]
 | Apache feature | 対応 | 理由 / 代替 |
 | --- | --- | --- |
 | `AuthType Digest` | 非対応 | nonce/challenge 検証が必要で軽量な CloudFront Functions 設計に合わない |
-| `AuthUserFile` | 非対応 | 認証情報は Secrets Manager で管理 |
+| `AuthUserFile .htpasswd` | 対応 | 同じS3ディレクトリの `.htpasswd` を参照 |
 | `AuthDigestProvider`, `AuthDigestDomain`, `AuthDigestNonceLifetime` | 非対応 | Digest 認証は対象外 |
-| `.htpasswd` 解析 | 非対応 | コンテンツバケットに秘密情報を置かない |
+| `.htpasswd` `{SHA}` | 対応 | `htpasswd -s` で生成。bcrypt、Apache MD5、cryptは非対応 |
 | `AuthGroupFile` | 非対応 | グループ認証は対象外 |
 | `Require user ...` | 非対応 | メンテナンス用途の `Require valid-user` のみ対応 |
 | `Require group ...` | 非対応 | グループ認証は対象外 |
@@ -224,21 +225,6 @@ SPA を S3 + CloudFront でホストする場合は、`CustomErrorResponses` を
 - `KVS_ARN`: CloudFront KeyValueStore ARN。未指定の場合、Lambda は検証と履歴保存だけを行います。
 - `KVS_CONFIG_KEY`: KVS に保存する設定 key。既定値は `htaccess-config`。
 - `ALLOWED_EXTERNAL_HOSTS`: 外部 redirect 先として許可する host のカンマ区切り allowlist。
-- `BASIC_AUTH_SECRET_ID`: Basic 認証情報を保存した Secrets Manager secret ID。
-
-`BASIC_AUTH_SECRET_ID` は次のどちらかの JSON を参照できます。
-
-```json
-{"authorization":"Basic dXNlcjpwYXNz"}
-```
-
-または:
-
-```json
-{"username":"user","password":"pass"}
-```
-
-生成される KVS 設定には、期待する `Authorization` ヘッダー値だけを保存します。平文パスワードは保存しません。
 
 ### Lambda 権限
 
@@ -264,17 +250,10 @@ Lambda execution role には概ね以下の権限が必要です。
       "Effect": "Allow",
       "Action": ["cloudfront-keyvaluestore:DescribeKeyValueStore", "cloudfront-keyvaluestore:UpdateKeys"],
       "Resource": "YOUR_KVS_ARN"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "secretsmanager:GetSecretValue",
-      "Resource": "YOUR_BASIC_AUTH_SECRET_ARN"
     }
   ]
 }
 ```
-
-メンテナンスモードを使わない場合、`BASIC_AUTH_SECRET_ID` と Secrets Manager 権限は省略できます。
 
 ### S3 Event
 
@@ -318,7 +297,7 @@ Lambda log group              30日または90日保持
 ### 注意事項
 
 - CloudFront Functions の関数を対象Cache Behaviorの `viewer-request` に関連付けてください。これにより `.htaccess`、`.htpasswd`、`_control-history` へのアクセスも403で拒否されます。
-- Basic 認証を使う場合は `BASIC_AUTH_SECRET_ID` が必須です。未設定の更新は rejected になり、直前の有効設定が維持されます。
+- Basic 認証を使う場合は、同じディレクトリの `.htpasswd` が必須です。未配置または不正な更新は rejected になり、直前の有効設定が維持されます。
 - `Require ip` は Basic 認証のバイパス専用で、汎用アクセス制御ではありません。
 - KVS の反映には時間がかかる場合があります。`.htaccess` 更新後の確認は 60〜90 秒待ってください。
 - 履歴と Lambda ログには Lifecycle／retention を設定してください。
@@ -392,7 +371,7 @@ Steps for building from scratch:
 
 1. Deploy `lambda/htaccess_bridge.py` as a Lambda function.
 2. Create a CloudFront KeyValueStore and set its ARN as `KVS_ARN`.
-3. Store the Basic auth credential in Secrets Manager and set `BASIC_AUTH_SECRET_ID`.
+3. For Basic auth, create `.htpasswd` with `htpasswd -s`.
 4. Configure S3 Event Notification for `.htaccess` create/update/delete events.
 5. Merge `cloudfront-function/handler.js` into the existing viewer-request CloudFront Functions code that performs index document routing.
 6. Upload `examples/.htaccess` to the S3 bucket with any S3 upload client.
@@ -464,9 +443,9 @@ Unsupported directives reject the upload and keep the last published KVS config.
 | Apache feature | Support | Reason / alternative |
 | --- | --- | --- |
 | `AuthType Digest` | No | Digest nonce/challenge validation is too stateful for this lightweight CloudFront Functions design |
-| `AuthUserFile` | No | Credentials are managed in Secrets Manager |
+| `AuthUserFile .htpasswd` | Yes | Reads `.htpasswd` from the same S3 directory |
 | `AuthDigestProvider`, `AuthDigestDomain`, `AuthDigestNonceLifetime` | No | Digest auth is not supported |
-| `.htpasswd` parsing | No | Do not store secrets in the content bucket |
+| `.htpasswd` `{SHA}` | Yes | Generate with `htpasswd -s`; bcrypt, Apache MD5, and crypt are unsupported |
 | `AuthGroupFile` | No | Group auth is out of scope |
 | `Require user ...` | No | Only maintenance-style `Require valid-user` is supported |
 | `Require group ...` | No | Group auth is out of scope |
@@ -524,21 +503,6 @@ If you need to host a SPA on S3 + CloudFront, consider a separate CloudFront dis
 - `KVS_ARN`: CloudFront KeyValueStore ARN. If omitted, Lambda only validates and writes history.
 - `KVS_CONFIG_KEY`: KVS key for published config. Default: `htaccess-config`.
 - `ALLOWED_EXTERNAL_HOSTS`: comma-separated allowlist for external redirect targets.
-- `BASIC_AUTH_SECRET_ID`: optional Secrets Manager secret for Basic auth credential.
-
-`BASIC_AUTH_SECRET_ID` can point to either:
-
-```json
-{"authorization":"Basic dXNlcjpwYXNz"}
-```
-
-or:
-
-```json
-{"username":"user","password":"pass"}
-```
-
-The generated KVS config stores only the expected `Authorization` header value, not the plain password.
 
 ### Lambda Permissions
 
@@ -564,17 +528,10 @@ The Lambda execution role needs permissions equivalent to:
       "Effect": "Allow",
       "Action": ["cloudfront-keyvaluestore:DescribeKeyValueStore", "cloudfront-keyvaluestore:UpdateKeys"],
       "Resource": "YOUR_KVS_ARN"
-    },
-    {
-      "Effect": "Allow",
-      "Action": "secretsmanager:GetSecretValue",
-      "Resource": "YOUR_BASIC_AUTH_SECRET_ARN"
     }
   ]
 }
 ```
-
-If maintenance mode is never used, `BASIC_AUTH_SECRET_ID` and the Secrets Manager permission can be omitted.
 
 ### S3 Event
 
@@ -610,7 +567,7 @@ History is append-only by object, not by appending to one large file. Configure 
 ### Notes
 
 - Associate the function in CloudFront Functions with the target cache behavior's `viewer-request` event. It also returns 403 for `.htaccess`, `.htpasswd`, and `_control-history` URLs.
-- `BASIC_AUTH_SECRET_ID` is required when Basic auth is enabled. Invalid updates are rejected and the last valid configuration remains active.
+- Basic auth requires `.htpasswd` in the same directory. Missing or invalid credentials are rejected and the last valid configuration remains active.
 - `Require ip` only bypasses Basic auth; it is not general-purpose access control.
 - KVS propagation may take time. Wait 60–90 seconds before testing an `.htaccess` update.
 - Configure S3 Lifecycle rules for history objects and log retention for Lambda.

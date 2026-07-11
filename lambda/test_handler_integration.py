@@ -23,6 +23,14 @@ def _load_redirects_from_kvs(kvs_stored):
     return redirects
 
 
+def _load_auth_scopes_from_kvs(kvs_stored):
+    meta = json.loads(kvs_stored[hb.KVS_KEY_AUTH_SCOPES_META])
+    scopes = []
+    for i in range(meta["chunkCount"]):
+        scopes.extend(json.loads(kvs_stored[f"{hb.KVS_KEY_AUTH_SCOPES_CHUNK_PREFIX}{i}"]))
+    return scopes
+
+
 class FakeConflictOnce(Exception):
     """Mimics a boto3 dynamically generated ConflictException."""
 
@@ -105,14 +113,6 @@ class FakeKVS:
             self.stored.pop(item["Key"], None)
         self.etag_counter += 1
         return {"ItemCount": len(self.stored), "TotalSizeInBytes": sum(len(v) for v in self.stored.values())}
-
-
-class FakeSecretsManager:
-    def __init__(self, secret_string=None):
-        self.secret_string = secret_string
-
-    def get_secret_value(self, SecretId):
-        return {"SecretString": self.secret_string}
 
 
 def _make_boto3_client_stub(fakes):
@@ -298,7 +298,7 @@ class HandlerIntegrationTests(unittest.TestCase):
         self.assertEqual(rejected_payload["status"], "rejected")
         self.assertIn("unsupported directive", rejected_payload["error"])
 
-    def test_handler_rejects_maintenance_without_basic_auth_secret(self):
+    def test_handler_rejects_maintenance_without_htpasswd(self):
         s3 = FakeS3(
             {
                 ".htaccess": """
@@ -309,7 +309,7 @@ class HandlerIntegrationTests(unittest.TestCase):
             }
         )
         kvs = FakeKVS()
-        # No BASIC_AUTH_SECRET_ID set: enabled maintenance mode must be rejected.
+        # A matching .htpasswd is required when maintenance mode is enabled.
         with patch.object(
             hb,
             "_boto3_client",
@@ -320,29 +320,26 @@ class HandlerIntegrationTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["status"], "rejected")
         self.assertNotIn(hb.KVS_KEY_MAINTENANCE, kvs.stored)
 
-    def test_handler_publishes_with_basic_auth_secret_configured(self):
+    def test_handler_publishes_when_htpasswd_is_uploaded(self):
         s3 = FakeS3(
             {
-                ".htaccess": """
-                AuthType Basic
-                AuthName "Members"
-                Require valid-user
-                """
+                ".htaccess": "AuthType Basic\nAuthName Members\nAuthUserFile .htpasswd\nRequire valid-user",
+                ".htpasswd": "user:{SHA}nU4eI71bcnBGqeO0t9tXvY1u5oQ=",
             }
         )
         kvs = FakeKVS()
-        secrets = FakeSecretsManager(secret_string=json.dumps({"username": "user", "password": "pass"}))
-        with patch.dict("os.environ", {"BASIC_AUTH_SECRET_ID": "test-secret"}):
-            with patch.object(
-                hb,
-                "_boto3_client",
-                _make_boto3_client_stub({"s3": s3, "cloudfront-keyvaluestore": kvs, "secretsmanager": secrets}),
-            ):
-                result = hb.handler(_s3_created_event("my-bucket", ".htaccess"), None)
+        with patch.object(
+            hb,
+            "_boto3_client",
+            _make_boto3_client_stub({"s3": s3, "cloudfront-keyvaluestore": kvs}),
+        ):
+            result = hb.handler(_s3_created_event("my-bucket", ".htpasswd"), None)
 
         self.assertEqual(result["results"][0]["status"], "published")
-        maintenance = json.loads(kvs.stored[hb.KVS_KEY_MAINTENANCE])
-        self.assertTrue(maintenance["authorization"].startswith("Basic "))
+        scopes = _load_auth_scopes_from_kvs(kvs.stored)
+        self.assertEqual(scopes[0]["credentials"][0]["username"], "user")
+        history = json.loads(s3.objects[result["results"][0]["historyKey"]])
+        self.assertNotIn("credentials", history["authScopes"][0])
 
     def test_handler_publishes_empty_config_when_last_htaccess_deleted(self):
         # No .htaccess files remain in the bucket at all.
@@ -508,10 +505,11 @@ class HandlerIntegrationTests(unittest.TestCase):
             result = hb.handler(_s3_created_event("my-bucket", ".htaccess"), None)
 
         self.assertEqual(result["results"][0]["status"], "published")
-        # 26 objects at page_size=5 requires 6 list_objects_v2 calls
+        # Both .htaccess and .htpasswd discovery paginate through the bucket.
+        # Each pass over 26 objects at page_size=5 requires 6 calls.
         # (5+5+5+5+5+1) to see every key, proving the loop actually paged
         # through instead of stopping after the first call.
-        self.assertEqual(len(s3.list_calls), 6)
+        self.assertEqual(len(s3.list_calls), 12)
         redirects = _load_redirects_from_kvs(kvs.stored)
         self.assertEqual(len(redirects), 1)
         self.assertEqual(redirects[0]["from"], "/old/")
