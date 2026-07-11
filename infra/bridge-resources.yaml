@@ -1,59 +1,23 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
-  Standalone S3 + CloudFront environment with the .htaccess bridge.
+  Bridge resources for an existing S3 + CloudFront site. Creates Lambda,
+  KeyValueStore, and a function in CloudFront Functions without modifying
+  the existing bucket notification configuration or Distribution.
 
 Parameters:
   ProjectName:
     Type: String
-    Default: htaccess-bridge-verify
+    Default: htaccess-bridge
+  ContentBucketName:
+    Type: String
+    Description: "Name of your EXISTING site content bucket (not created by this template)."
 Resources:
-  # ---------------------------------------------------------------------
-  # Content bucket
-  # ---------------------------------------------------------------------
-  ContentBucket:
-    Type: AWS::S3::Bucket
-    DeletionPolicy: Delete
-    Properties:
-      BucketName: !Sub "${ProjectName}-content-${AWS::AccountId}"
-      BucketEncryption:
-        ServerSideEncryptionConfiguration:
-          - ServerSideEncryptionByDefault:
-              SSEAlgorithm: AES256
-      PublicAccessBlockConfiguration:
-        BlockPublicAcls: true
-        BlockPublicPolicy: true
-        IgnorePublicAcls: true
-        RestrictPublicBuckets: true
-      VersioningConfiguration:
-        Status: Enabled
-      LifecycleConfiguration:
-        Rules:
-          - Id: ExpireRejectedHistory
-            Status: Enabled
-            Prefix: _control-history/rejected/
-            ExpirationInDays: 90
-            NoncurrentVersionExpirationInDays: 90
-          - Id: ArchivePublishedHistory
-            Status: Enabled
-            Prefix: _control-history/published/
-            Transitions:
-              - StorageClass: GLACIER
-                TransitionInDays: 90
-            ExpirationInDays: 365
-            NoncurrentVersionExpirationInDays: 365
-
-  # ---------------------------------------------------------------------
-  # CloudFront KeyValueStore
-  # ---------------------------------------------------------------------
   HtaccessConfigStore:
     Type: AWS::CloudFront::KeyValueStore
     Properties:
       Name: !Sub "${ProjectName}-kvs"
       Comment: "Normalized .htaccess config published by htaccess_bridge Lambda"
 
-  # ---------------------------------------------------------------------
-  # Lambda execution role (least privilege, scoped to this project's resources)
-  # ---------------------------------------------------------------------
   HtaccessBridgeManagedPolicy:
     Type: AWS::IAM::ManagedPolicy
     Properties:
@@ -65,13 +29,13 @@ Resources:
             Effect: Allow
             Action:
               - s3:ListBucket
-            Resource: !GetAtt ContentBucket.Arn
+            Resource: !Sub "arn:aws:s3:::${ContentBucketName}"
           - Sid: S3ContentObjectAccess
             Effect: Allow
             Action:
               - s3:GetObject
               - s3:PutObject
-            Resource: !Sub "${ContentBucket.Arn}/*"
+            Resource: !Sub "arn:aws:s3:::${ContentBucketName}/*"
           - Sid: CloudFrontKvsAccess
             Effect: Allow
             Action:
@@ -100,9 +64,6 @@ Resources:
       ManagedPolicyArns:
         - !Ref HtaccessBridgeManagedPolicy
 
-  # ---------------------------------------------------------------------
-  # Lambda function
-  # ---------------------------------------------------------------------
   HtaccessBridgeFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -113,9 +74,12 @@ Resources:
       Timeout: 30
       MemorySize: 256
       Code:
-        # Placeholder only. Deploy the built archive after this stack is ready:
-        #   aws lambda update-function-code --function-name <LambdaFunctionName> \
+        # Placeholder only. The real code (with botocore[crt]) typically exceeds
+        # what an inline ZipFile can hold, and is deployed separately with:
+        #   aws lambda update-function-code --function-name <FunctionName output> \
         #     --zip-file fileb://htaccess_bridge.zip
+        # This avoids needing a dedicated S3 artifact bucket. See
+        # docs/integration-guide.md step 2.
         ZipFile: |
           def handler(event, context):
               raise RuntimeError(
@@ -134,9 +98,6 @@ Resources:
       LogGroupName: !Sub "/aws/lambda/${ProjectName}-fn"
       RetentionInDays: 7
 
-  # ---------------------------------------------------------------------
-  # S3 -> Lambda event notification permission
-  # ---------------------------------------------------------------------
   ContentBucketLambdaPermission:
     Type: AWS::Lambda::Permission
     Properties:
@@ -144,174 +105,14 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: s3.amazonaws.com
       SourceAccount: !Ref AWS::AccountId
-      SourceArn: !GetAtt ContentBucket.Arn
+      SourceArn: !Sub "arn:aws:s3:::${ContentBucketName}"
 
-  # ---------------------------------------------------------------------
-  # S3 bucket notification configuration (custom resource).
-  #
-  # A custom resource configures notifications after both the bucket and
-  # Lambda permission exist, avoiding the usual S3/Lambda circular dependency.
-  # ---------------------------------------------------------------------
-  BucketNotificationManagedPolicy:
-    Type: AWS::IAM::ManagedPolicy
-    Properties:
-      ManagedPolicyName: !Sub "${ProjectName}-bucket-notification-policy"
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: S3BucketNotificationAccess
-            Effect: Allow
-            Action:
-              - s3:GetBucketNotification
-              - s3:PutBucketNotification
-            Resource: !GetAtt ContentBucket.Arn
-          - Sid: CloudWatchLogsAccess
-            Effect: Allow
-            Action:
-              - logs:CreateLogGroup
-              - logs:CreateLogStream
-              - logs:PutLogEvents
-            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-bucket-notification-fn*"
-
-  BucketNotificationExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      RoleName: !Sub "${ProjectName}-bucket-notification-role"
-      AssumeRolePolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - !Ref BucketNotificationManagedPolicy
-
-  BucketNotificationFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: !Sub "${ProjectName}-bucket-notification-fn"
-      Runtime: python3.13
-      Handler: index.handler
-      Role: !GetAtt BucketNotificationExecutionRole.Arn
-      Timeout: 30
-      MemorySize: 128
-      Code:
-        ZipFile: |
-          # cfnresponse is not guaranteed to be preinstalled on newer Python
-          # Lambda runtimes (it is only bundled on some legacy runtimes), so
-          # this sends the CloudFormation custom resource response directly
-          # via urllib against the presigned ResponseURL instead of relying
-          # on that module being importable.
-          import json
-          import urllib.request
-
-          import boto3
-
-          def send_response(event, context, status, reason=""):
-              response_body = json.dumps(
-                  {
-                      "Status": status,
-                      "Reason": reason or f"See CloudWatch Logs: {context.log_stream_name}",
-                      "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
-                      "StackId": event["StackId"],
-                      "RequestId": event["RequestId"],
-                      "LogicalResourceId": event["LogicalResourceId"],
-                      "Data": {},
-                  }
-              ).encode("utf-8")
-              req = urllib.request.Request(
-                  url=event["ResponseURL"],
-                  data=response_body,
-                  method="PUT",
-                  headers={"Content-Type": "", "Content-Length": str(len(response_body))},
-              )
-              urllib.request.urlopen(req)
-
-          def handler(event, context):
-              try:
-                  request_type = event["RequestType"]
-                  props = event["ResourceProperties"]
-                  bucket_name = props["BucketName"]
-                  lambda_arn = props["LambdaFunctionArn"]
-                  s3 = boto3.client("s3")
-
-                  if request_type in ("Create", "Update"):
-                      config = {
-                          "LambdaFunctionConfigurations": [
-                              {
-                                  "LambdaFunctionArn": lambda_arn,
-                                  "Events": ["s3:ObjectCreated:*"],
-                                  "Filter": {
-                                      "Key": {
-                                          "FilterRules": [
-                                              {"Name": "suffix", "Value": ".htaccess"}
-                                          ]
-                                      }
-                                  },
-                              },
-                              {
-                                  "LambdaFunctionArn": lambda_arn,
-                                  "Events": ["s3:ObjectRemoved:*"],
-                                  "Filter": {
-                                      "Key": {
-                                          "FilterRules": [
-                                              {"Name": "suffix", "Value": ".htaccess"}
-                                          ]
-                                      }
-                                  },
-                              },
-                              {
-                                  "LambdaFunctionArn": lambda_arn,
-                                  "Events": ["s3:ObjectCreated:*"],
-                                  "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": ".htpasswd"}]}},
-                              },
-                              {
-                                  "LambdaFunctionArn": lambda_arn,
-                                  "Events": ["s3:ObjectRemoved:*"],
-                                  "Filter": {"Key": {"FilterRules": [{"Name": "suffix", "Value": ".htpasswd"}]}},
-                              },
-                          ]
-                      }
-                      s3.put_bucket_notification_configuration(
-                          Bucket=bucket_name, NotificationConfiguration=config
-                      )
-                  elif request_type == "Delete":
-                      # Best-effort: clear notifications so the bucket doesn't keep
-                      # referencing a Lambda that may be deleted alongside this stack.
-                      s3.put_bucket_notification_configuration(
-                          Bucket=bucket_name, NotificationConfiguration={}
-                      )
-
-                  send_response(event, context, "SUCCESS")
-              except Exception as exc:  # noqa: BLE001
-                  send_response(event, context, "FAILED", reason=str(exc))
-
-  BucketNotificationLogGroup:
-    Type: AWS::Logs::LogGroup
-    DeletionPolicy: Delete
-    Properties:
-      LogGroupName: !Sub "/aws/lambda/${ProjectName}-bucket-notification-fn"
-      RetentionInDays: 7
-
-  ContentBucketNotification:
-    Type: Custom::S3BucketNotification
-    DependsOn:
-      - ContentBucketLambdaPermission
-    Properties:
-      ServiceToken: !GetAtt BucketNotificationFunction.Arn
-      BucketName: !Ref ContentBucket
-      LambdaFunctionArn: !GetAtt HtaccessBridgeFunction.Arn
-
-  # ---------------------------------------------------------------------
-  # CloudFront Functions viewer-request function
-  # ---------------------------------------------------------------------
   HtaccessViewerRequestFunction:
     Type: AWS::CloudFront::Function
     Properties:
       Name: !Sub "${ProjectName}-viewer-request"
       FunctionConfig:
-        Comment: "htaccess bridge viewer-request function (basic redirect verification)"
+        Comment: "htaccess bridge viewer-request function"
         Runtime: cloudfront-js-2.0
         KeyValueStoreAssociations:
           - KeyValueStoreARN: !GetAtt HtaccessConfigStore.Arn
@@ -579,70 +380,13 @@ Resources:
           return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
         }
 
-  # ---------------------------------------------------------------------
-  # CloudFront Distribution (default *.cloudfront.net domain, no custom domain/ACM)
-  # ---------------------------------------------------------------------
-  ContentBucketOAI:
-    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
-    Properties:
-      CloudFrontOriginAccessIdentityConfig:
-        Comment: !Sub "OAI for ${ProjectName} content bucket"
-
-  Distribution:
-    Type: AWS::CloudFront::Distribution
-    Properties:
-      DistributionConfig:
-        Enabled: true
-        Comment: !Sub "${ProjectName} verification distribution"
-        DefaultRootObject: index.html
-        Origins:
-          - Id: ContentBucketOrigin
-            DomainName: !GetAtt ContentBucket.RegionalDomainName
-            S3OriginConfig:
-              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${ContentBucketOAI}"
-        DefaultCacheBehavior:
-          TargetOriginId: ContentBucketOrigin
-          ViewerProtocolPolicy: redirect-to-https
-          AllowedMethods: [GET, HEAD]
-          CachedMethods: [GET, HEAD]
-          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
-          FunctionAssociations:
-            - EventType: viewer-request
-              FunctionARN: !GetAtt HtaccessViewerRequestFunction.FunctionMetadata.FunctionARN
-        PriceClass: PriceClass_200
-
-  ContentBucketOAIPolicy:
-    Type: AWS::S3::BucketPolicy
-    Properties:
-      Bucket: !Ref ContentBucket
-      PolicyDocument:
-        Version: "2012-10-17"
-        Statement:
-          - Sid: AllowCloudFrontOAIRead
-            Effect: Allow
-            Principal:
-              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${ContentBucketOAI}"
-            Action: s3:GetObject
-            Resource: !Sub "${ContentBucket.Arn}/*"
-          - Sid: DenyInsecureTransport
-            Effect: Deny
-            Principal: "*"
-            Action: "s3:*"
-            Resource:
-              - !GetAtt ContentBucket.Arn
-              - !Sub "${ContentBucket.Arn}/*"
-            Condition:
-              Bool:
-                "aws:SecureTransport": "false"
-
 Outputs:
-  ContentBucketName:
-    Value: !Ref ContentBucket
-  DistributionDomainName:
-    Value: !GetAtt Distribution.DomainName
-  DistributionId:
-    Value: !Ref Distribution
   KvsArn:
     Value: !GetAtt HtaccessConfigStore.Arn
   LambdaFunctionName:
     Value: !Ref HtaccessBridgeFunction
+  LambdaFunctionArn:
+    Value: !GetAtt HtaccessBridgeFunction.Arn
+  CloudFrontFunctionArn:
+    Description: "Add this to your EXISTING Distribution's cache behavior FunctionAssociations (viewer-request). This template does not modify your Distribution."
+    Value: !GetAtt HtaccessViewerRequestFunction.FunctionMetadata.FunctionARN

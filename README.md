@@ -2,11 +2,11 @@
 
 Use a small, safe subset of Apache `.htaccess` with static websites hosted on Amazon S3 and CloudFront.
 
-Upload `.htaccess` files alongside your content. A Lambda function validates and converts them, publishes the normalized rules to CloudFront KeyValueStore, and a viewer-request function in CloudFront Functions applies them at the edge.
+Upload `.htaccess` files alongside your content and `.htpasswd` files when Basic authentication is needed. When either changes, Lambda reloads and validates the site configuration, publishes normalized rules to CloudFront KeyValueStore, and a viewer-request function in CloudFront Functions applies them at the edge.
 
-Amazon S3 + CloudFront で配信する静的サイトで、Apache `.htaccess` の安全な一部を利用できるようにする仕組みです。コンテンツと一緒に `.htaccess` をS3へアップロードすると、Lambdaが検証・変換してCloudFront KeyValueStoreへ反映し、CloudFront Functions の関数がエッジで適用します。
+Amazon S3 + CloudFrontで配信する静的サイトで、Apache `.htaccess` の安全な一部を利用できる仕組みです。コンテンツと一緒に `.htaccess` を、Basic認証を使う場合は `.htpasswd` もS3へアップロードします。どちらかが更新されると、Lambdaがサイト設定を読み直して検証・変換し、CloudFront KeyValueStoreへ反映します。CloudFront Functionsのviewer-request関数が、その設定をエッジで適用します。
 
-パスリダイレクト、Basic認証によるメンテナンスモード、ディレクトリ単位の設定、限定的な `DirectoryIndex` に対応します。Apacheとの完全互換ではありません。新規環境は[構築手順](docs/standalone-guide.md)、既存環境への追加は[組み込みガイド](docs/integration-guide.md)を参照してください。
+パスリダイレクト、Basic認証によるメンテナンスモード、ディレクトリ単位の設定、限定的な `DirectoryIndex` に対応します。Apacheとの完全互換ではありません。導入方法は[既存環境への導入ガイド](docs/integration-guide.md)を参照してください。
 
 ## What it supports
 
@@ -22,9 +22,9 @@ It intentionally does not emulate all of Apache. Features such as `RewriteCond`,
 ## How it works
 
 ```text
-.htaccess uploaded to S3
+.htaccess or .htpasswd uploaded to S3
         ↓ S3 event
-Lambda validates all .htaccess files
+Lambda reloads and validates the site configuration
         ↓
 CloudFront KeyValueStore
         ↓ viewer-request
@@ -35,11 +35,8 @@ Invalid updates are recorded under `_control-history/rejected/` and do not repla
 
 ## Get started
 
-Choose the guide for your environment:
-
-- New S3 + CloudFront environment: follow the [standalone setup guide](docs/standalone-guide.md).
 - Existing S3 + CloudFront environment: follow the [integration guide](docs/integration-guide.md).
-- Content editors: see the [content creator guide](docs/content-creator-guide.md), available in Japanese and English.
+- Content editors: see the [content creator guide](docs/content-creator-guide.md).
 
 Build the Lambda deployment archive:
 
@@ -61,7 +58,6 @@ node cloudfront-function/test_handler_logic.js
 ## Documentation
 
 - [Integration guide / 既存環境への組み込み](docs/integration-guide.md)
-- [Standalone setup / 新規環境の構築](docs/standalone-guide.md)
 - [Content creator guide / コンテンツ制作者向けガイド](docs/content-creator-guide.md)
 - [Full reference / 詳細仕様](docs/reference.md)
 - [Contributing](CONTRIBUTING.md)

@@ -17,7 +17,7 @@ S3 + CloudFront static sites do not evaluate Apache `.htaccess` files. This proj
 
 ### 概要
 
-このリファレンス実装は、S3 にアップロードされた `.htaccess` を Lambda で検証・変換し、CloudFront KeyValueStore に反映します。CloudFront Functions の viewer request 関数コードは、KVS の設定を使って以下を処理します。
+このリファレンス実装は、S3にアップロードされた `.htaccess` と `.htpasswd` をLambdaで検証・変換し、CloudFront KeyValueStoreに反映します。CloudFront Functionsのviewer-request関数は、KVSの設定を使って以下を処理します。
 
 ```text
 hidden file block
@@ -41,14 +41,14 @@ SPA（Single Page Application）のクライアントサイドルーティング
 ```text
 S3 upload client
   |
-  | upload / update / delete .htaccess
+  | upload / update / delete .htaccess or .htpasswd
   v
 S3 Event Notification
   |
   v
 Lambda
   |
-  | parse and validate all .htaccess files
+  | reload and validate the site configuration
   v
 CloudFront KeyValueStore
   |
@@ -59,14 +59,15 @@ CloudFront Functions
 S3 origin
 ```
 
-CloudFront Functions はリクエストごとに S3 の `.htaccess` を読みません。`.htaccess` の作成・更新・削除時に Lambda が全 `.htaccess` を読み直し、1 つの正規化済み設定として KVS に publish します。
+CloudFront FunctionsはリクエストごとにS3の設定ファイルを読みません。`.htaccess` または `.htpasswd` の更新時にLambdaがサイト設定を読み直し、1つの正規化済み設定としてKVSにpublishします。
 
 ### ファイル
 
-- `lambda/htaccess_bridge.py`: S3 Event Lambda と `.htaccess` パーサー
+- `lambda/htaccess_bridge.py`: S3 Event Lambdaと `.htaccess`／`.htpasswd` パーサー
 - `lambda/test_htaccess_bridge.py`: パーサーとバリデータのテスト
 - `cloudfront-function/handler.js`: CloudFront Functions JavaScript runtime 2.0 サンプル
 - `examples/.htaccess`: サポート対象構文のサンプル
+- `examples/.htpasswd`: Basic認証情報のサンプル
 - `docs/content-creator-guide.md`: コンテンツ制作者向けの短い利用ガイド
 - `docs/integration-guide.md`: 既存の S3 + CloudFront 環境への組み込み手順（新規構築ではなく既存リソースに追加したい場合）
 - `scripts/build-lambda.sh`: Linux x86_64 / Python 3.13 向け Lambda ZIP の再現可能なビルド
@@ -87,16 +88,16 @@ Lambda ZIP のビルド:
 
 ### クイックスタート
 
-`infra/standalone.yaml` は新規構築用テンプレートです。既存の S3 バケット・CloudFront Distribution に組み込む場合は [組み込みガイド](integration-guide.md) を参照してください。Lambda ZIP はS3アーティファクトバケットを使わず、スタック作成後に直接アップロードします。
+既存のS3バケット・CloudFront Distributionへの導入は[組み込みガイド](integration-guide.md)を参照してください。`infra/bridge-resources.yaml`は既存環境を変更せず、bridge専用のKVS、Lambda、CloudFront Functionを作成します。
 
 新規構築の場合の手順:
 
 1. `lambda/htaccess_bridge.py` を Lambda 関数としてデプロイします。
 2. CloudFront KeyValueStore を作成し、ARN を `KVS_ARN` に設定します。
 3. Basic 認証を使う場合は、`htpasswd -s` で `.htpasswd` を作成します。
-4. S3 Event Notification で `.htaccess` の作成・更新・削除イベントを Lambda に送ります。
+4. S3 Event Notificationで `.htaccess` と `.htpasswd` の作成・更新・削除イベントをLambdaに送ります。
 5. 既存の index document routing 用 CloudFront Functions 関数コードに `cloudfront-function/handler.js` の処理順序を統合します。
-6. 任意の S3 アップロードクライアントで `examples/.htaccess` を S3 バケットにアップロードします。
+6. 任意のS3アップロードクライアントで `examples/.htpasswd` と `examples/.htaccess` をS3バケットにアップロードします。
 7. `_control-history/published/` に published JSON が作成されることを確認します。
 8. CloudFront 経由で動作を確認します。
 
@@ -257,7 +258,7 @@ Lambda execution role には概ね以下の権限が必要です。
 
 ### S3 Event
 
-S3 Event Notification で、suffix `.htaccess` の `ObjectCreated` と `ObjectRemoved` を Lambda に送ります。通常コンテンツすべてで Lambda を起動しないでください。
+S3 Event Notificationで、suffix `.htaccess` と `.htpasswd` の `ObjectCreated` と `ObjectRemoved` をLambdaに送ります。通常コンテンツすべてでLambdaを起動しないでください。
 
 推奨イベント:
 
@@ -270,7 +271,9 @@ s3:ObjectRemoved:Delete
 s3:ObjectRemoved:DeleteMarkerCreated
 ```
 
-`.htaccess` が作成・更新・コピー・multipart upload・削除されるたびに、Lambda はバケット内に残っている全 `.htaccess` を読み直し、1 つの正規化済み設定を KVS に publish します。最後の `.htaccess` が削除された場合は空設定を publish し、`.htaccess` 由来の認証と redirect を無効化します。
+`.htaccess` または `.htpasswd` が更新されるたびに、Lambdaはサイト設定を読み直してKVSにpublishします。最後の `.htaccess` が削除された場合は空設定をpublishします。Basic認証が有効なのに対応する `.htpasswd` がない場合はrejectedとなり、直前の有効設定を維持します。
+
+#### 履歴
 
 成功履歴:
 
@@ -284,29 +287,31 @@ _control-history/published/YYYYMMDDTHHMMSSZ-<source-hash>.json
 _control-history/rejected/YYYYMMDDTHHMMSSZ-<source-hash>.json
 ```
 
-履歴は 1 つの巨大ファイルに追記せず、試行ごとに小さな JSON オブジェクトを作成します。S3 Lifecycle と CloudWatch Logs retention を必ず設定してください。
+履歴は 1 つの巨大ファイルに追記せず、試行ごとに小さな JSON オブジェクトを作成します。必要に応じてS3 LifecycleとCloudWatch Logs retentionを設定してください。保持期間はバケットのバージョニング設定と監査要件に合わせ、バージョニングが有効な場合は非現行バージョンも考慮します。
 
 例:
 
 ```text
-_control-history/rejected/*   90日で削除
-_control-history/published/*  1年保持、または90日後に Glacier へ移行
-Lambda log group              30日または90日保持
+_control-history/rejected/*   90日後に削除
+_control-history/published/*  90日後に削除
+Lambda log group              7日保持（テンプレートの初期値）
 ```
+
+S3バージョニングが有効な場合、この例の現行オブジェクトの期限設定だけでは非現行バージョンは削除されません。非現行バージョンの保持期間も別途設定してください。
 
 ### 注意事項
 
 - CloudFront Functions の関数を対象Cache Behaviorの `viewer-request` に関連付けてください。これにより `.htaccess`、`.htpasswd`、`_control-history` へのアクセスも403で拒否されます。
 - Basic 認証を使う場合は、同じディレクトリの `.htpasswd` が必須です。未配置または不正な更新は rejected になり、直前の有効設定が維持されます。
 - `Require ip` は Basic 認証のバイパス専用で、汎用アクセス制御ではありません。
-- KVS の反映には時間がかかる場合があります。`.htaccess` 更新後の確認は 60〜90 秒待ってください。
-- 履歴と Lambda ログには Lifecycle／retention を設定してください。
+- KVSの反映には時間がかかる場合があります。設定更新後の確認は60〜90秒待ってください。
+- 必要に応じて、履歴とLambdaログにLifecycle／retentionを設定してください。
 
 ## English
 
 ### Overview
 
-This reference implementation validates and converts `.htaccess` files uploaded to S3 with Lambda, then publishes normalized rules to CloudFront KeyValueStore. CloudFront Functions viewer-request code uses that KVS config to handle:
+This reference implementation validates and converts `.htaccess` and `.htpasswd` files uploaded to S3, then publishes normalized rules to CloudFront KeyValueStore. A viewer-request function in CloudFront Functions uses that KVS config to handle:
 
 ```text
 hidden file block
@@ -330,14 +335,14 @@ SPA (Single Page Application) client-side routing fallback (rewriting every non-
 ```text
 S3 upload client
   |
-  | upload / update / delete .htaccess
+  | upload / update / delete .htaccess or .htpasswd
   v
 S3 Event Notification
   |
   v
 Lambda
   |
-  | parse and validate all .htaccess files
+  | reload and validate the site configuration
   v
 CloudFront KeyValueStore
   |
@@ -348,7 +353,7 @@ CloudFront Functions
 S3 origin
 ```
 
-CloudFront Functions does not read `.htaccess` from S3 on each request. Whenever a `.htaccess` file is created, updated, or deleted, Lambda reloads all `.htaccess` files and publishes one flattened config to KVS.
+CloudFront Functions does not read configuration files from S3 on each request. When either `.htaccess` or `.htpasswd` changes, Lambda reloads the site configuration and publishes one normalized config to KVS.
 
 ### Quick Start
 
@@ -365,16 +370,16 @@ Build the Lambda deployment archive:
 ./scripts/build-lambda.sh
 ```
 
-`infra/standalone.yaml` creates a new environment. For an existing S3 bucket and CloudFront Distribution, follow the [integration guide](integration-guide.md). The Lambda ZIP is uploaded directly after stack creation, without an S3 artifact bucket.
+Follow the [integration guide](integration-guide.md) for an existing S3 bucket and CloudFront Distribution. `infra/bridge-resources.yaml` creates only the bridge KVS, Lambda, and CloudFront Function without modifying the existing environment.
 
 Steps for building from scratch:
 
 1. Deploy `lambda/htaccess_bridge.py` as a Lambda function.
 2. Create a CloudFront KeyValueStore and set its ARN as `KVS_ARN`.
 3. For Basic auth, create `.htpasswd` with `htpasswd -s`.
-4. Configure S3 Event Notification for `.htaccess` create/update/delete events.
+4. Configure S3 Event Notification for `.htaccess` and `.htpasswd` create/update/delete events.
 5. Merge `cloudfront-function/handler.js` into the existing viewer-request CloudFront Functions code that performs index document routing.
-6. Upload `examples/.htaccess` to the S3 bucket with any S3 upload client.
+6. Upload `examples/.htpasswd` and `examples/.htaccess` to the S3 bucket with any S3 upload client.
 7. Confirm that Lambda writes a published JSON under `_control-history/published/`.
 8. Confirm CloudFront behavior:
 
@@ -535,7 +540,7 @@ The Lambda execution role needs permissions equivalent to:
 
 ### S3 Event
 
-Configure S3 Event Notification for `ObjectCreated` and `ObjectRemoved` with suffix `.htaccess`. Do not trigger this Lambda for every content upload.
+Configure S3 Event Notification for `ObjectCreated` and `ObjectRemoved` with suffixes `.htaccess` and `.htpasswd`. Do not trigger this Lambda for every content upload.
 
 Recommended events:
 
@@ -548,7 +553,9 @@ s3:ObjectRemoved:Delete
 s3:ObjectRemoved:DeleteMarkerCreated
 ```
 
-When any `.htaccess` is uploaded, overwritten, copied, multipart-uploaded, or deleted, Lambda lists all remaining `.htaccess` files and publishes one flattened KVS config. If the last `.htaccess` is deleted, Lambda publishes an empty config, disabling `.htaccess`-driven auth and redirects.
+When either `.htaccess` or `.htpasswd` changes, Lambda reloads the site configuration and publishes it to KVS. Deleting the last `.htaccess` publishes an empty config. If Basic auth is enabled without a matching `.htpasswd`, the update is rejected and the last valid config remains active.
+
+#### History
 
 Successful publishes are written under:
 
@@ -562,12 +569,22 @@ Rejected uploads are written under:
 _control-history/rejected/YYYYMMDDTHHMMSSZ-<source-hash>.json
 ```
 
-History is append-only by object, not by appending to one large file. Configure S3 Lifecycle rules and CloudWatch Logs retention.
+History is append-only by object, not by appending to one large file. Configure S3 Lifecycle rules and CloudWatch Logs retention if needed. Choose retention based on the bucket's versioning state and audit requirements; for a versioned bucket, account for noncurrent versions as well.
+
+Example:
+
+```text
+_control-history/rejected/*   expire after 90 days
+_control-history/published/*  expire after 90 days
+Lambda log group              retain for 7 days (template default)
+```
+
+For a versioned bucket, expiring current objects as shown above does not remove noncurrent versions. Configure their retention separately.
 
 ### Notes
 
 - Associate the function in CloudFront Functions with the target cache behavior's `viewer-request` event. It also returns 403 for `.htaccess`, `.htpasswd`, and `_control-history` URLs.
 - Basic auth requires `.htpasswd` in the same directory. Missing or invalid credentials are rejected and the last valid configuration remains active.
 - `Require ip` only bypasses Basic auth; it is not general-purpose access control.
-- KVS propagation may take time. Wait 60–90 seconds before testing an `.htaccess` update.
-- Configure S3 Lifecycle rules for history objects and log retention for Lambda.
+- KVS propagation may take time. Wait 60–90 seconds after a configuration update before testing.
+- Configure S3 Lifecycle rules for history objects and Lambda log retention if needed.

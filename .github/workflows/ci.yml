@@ -25,4 +25,4 @@ jobs:
       - name: Install CloudFormation linter
         run: python -m pip install cfn-lint
       - name: Validate CloudFormation templates
-        run: cfn-lint infra/standalone.yaml infra/integration-addon.yaml
+        run: cfn-lint infra/bridge-resources.yaml
