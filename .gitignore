@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# OS and editor files
+.DS_Store
+.idea/
+.vscode/
+
+# Local build artifacts
+*.zip
+package/
+dist/

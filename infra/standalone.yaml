@@ -1,0 +1,635 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Standalone S3 + CloudFront environment with the .htaccess bridge.
+
+Parameters:
+  ProjectName:
+    Type: String
+    Default: htaccess-bridge-verify
+  BasicAuthSecretId:
+    Type: String
+    Default: ""
+    Description: "Optional Secrets Manager secret name/ARN for Basic auth credential. Leave empty if maintenance mode is not used."
+
+Conditions:
+  HasBasicAuthSecret: !Not [!Equals [!Ref BasicAuthSecretId, ""]]
+
+Resources:
+  # ---------------------------------------------------------------------
+  # Content bucket
+  # ---------------------------------------------------------------------
+  ContentBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub "${ProjectName}-content-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireRejectedHistory
+            Status: Enabled
+            Prefix: _control-history/rejected/
+            ExpirationInDays: 90
+            NoncurrentVersionExpirationInDays: 90
+          - Id: ArchivePublishedHistory
+            Status: Enabled
+            Prefix: _control-history/published/
+            Transitions:
+              - StorageClass: GLACIER
+                TransitionInDays: 90
+            ExpirationInDays: 365
+            NoncurrentVersionExpirationInDays: 365
+
+  # ---------------------------------------------------------------------
+  # CloudFront KeyValueStore
+  # ---------------------------------------------------------------------
+  HtaccessConfigStore:
+    Type: AWS::CloudFront::KeyValueStore
+    Properties:
+      Name: !Sub "${ProjectName}-kvs"
+      Comment: "Normalized .htaccess config published by htaccess_bridge Lambda"
+
+  # ---------------------------------------------------------------------
+  # Lambda execution role (least privilege, scoped to this project's resources)
+  # ---------------------------------------------------------------------
+  HtaccessBridgeManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-lambda-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: S3ContentBucketAccess
+            Effect: Allow
+            Action:
+              - s3:ListBucket
+            Resource: !GetAtt ContentBucket.Arn
+          - Sid: S3ContentObjectAccess
+            Effect: Allow
+            Action:
+              - s3:GetObject
+              - s3:PutObject
+            Resource: !Sub "${ContentBucket.Arn}/*"
+          - Sid: CloudFrontKvsAccess
+            Effect: Allow
+            Action:
+              - cloudfront-keyvaluestore:DescribeKeyValueStore
+              - cloudfront-keyvaluestore:UpdateKeys
+            Resource: !GetAtt HtaccessConfigStore.Arn
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-fn*"
+          - !If
+            - HasBasicAuthSecret
+            - Sid: SecretsManagerBasicAuthAccess
+              Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Sub "arn:aws:secretsmanager:${AWS::Region}:${AWS::AccountId}:secret:${BasicAuthSecretId}*"
+            - !Ref AWS::NoValue
+
+  HtaccessBridgeExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-lambda-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref HtaccessBridgeManagedPolicy
+
+  # ---------------------------------------------------------------------
+  # Lambda function
+  # ---------------------------------------------------------------------
+  HtaccessBridgeFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-fn"
+      Runtime: python3.13
+      Handler: htaccess_bridge.handler
+      Role: !GetAtt HtaccessBridgeExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Code:
+        # Placeholder only. Deploy the built archive after this stack is ready:
+        #   aws lambda update-function-code --function-name <LambdaFunctionName> \
+        #     --zip-file fileb://htaccess_bridge.zip
+        ZipFile: |
+          def handler(event, context):
+              raise RuntimeError(
+                  "Placeholder code. Deploy the real function with: "
+                  "aws lambda update-function-code --zip-file fileb://htaccess_bridge.zip"
+              )
+      Environment:
+        Variables:
+          KVS_ARN: !GetAtt HtaccessConfigStore.Arn
+          HISTORY_PREFIX: _control-history
+          BASIC_AUTH_SECRET_ID: !If [HasBasicAuthSecret, !Ref BasicAuthSecretId, !Ref "AWS::NoValue"]
+
+  HtaccessBridgeLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-fn"
+      RetentionInDays: 7
+
+  # ---------------------------------------------------------------------
+  # S3 -> Lambda event notification permission
+  # ---------------------------------------------------------------------
+  ContentBucketLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !GetAtt HtaccessBridgeFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !GetAtt ContentBucket.Arn
+
+  # ---------------------------------------------------------------------
+  # S3 bucket notification configuration (custom resource).
+  #
+  # A custom resource configures notifications after both the bucket and
+  # Lambda permission exist, avoiding the usual S3/Lambda circular dependency.
+  # ---------------------------------------------------------------------
+  BucketNotificationManagedPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "${ProjectName}-bucket-notification-policy"
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: S3BucketNotificationAccess
+            Effect: Allow
+            Action:
+              - s3:GetBucketNotification
+              - s3:PutBucketNotification
+            Resource: !GetAtt ContentBucket.Arn
+          - Sid: CloudWatchLogsAccess
+            Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+            Resource: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/${ProjectName}-bucket-notification-fn*"
+
+  BucketNotificationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "${ProjectName}-bucket-notification-role"
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Ref BucketNotificationManagedPolicy
+
+  BucketNotificationFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub "${ProjectName}-bucket-notification-fn"
+      Runtime: python3.13
+      Handler: index.handler
+      Role: !GetAtt BucketNotificationExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 128
+      Code:
+        ZipFile: |
+          # cfnresponse is not guaranteed to be preinstalled on newer Python
+          # Lambda runtimes (it is only bundled on some legacy runtimes), so
+          # this sends the CloudFormation custom resource response directly
+          # via urllib against the presigned ResponseURL instead of relying
+          # on that module being importable.
+          import json
+          import urllib.request
+
+          import boto3
+
+          def send_response(event, context, status, reason=""):
+              response_body = json.dumps(
+                  {
+                      "Status": status,
+                      "Reason": reason or f"See CloudWatch Logs: {context.log_stream_name}",
+                      "PhysicalResourceId": event.get("PhysicalResourceId") or context.log_stream_name,
+                      "StackId": event["StackId"],
+                      "RequestId": event["RequestId"],
+                      "LogicalResourceId": event["LogicalResourceId"],
+                      "Data": {},
+                  }
+              ).encode("utf-8")
+              req = urllib.request.Request(
+                  url=event["ResponseURL"],
+                  data=response_body,
+                  method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(response_body))},
+              )
+              urllib.request.urlopen(req)
+
+          def handler(event, context):
+              try:
+                  request_type = event["RequestType"]
+                  props = event["ResourceProperties"]
+                  bucket_name = props["BucketName"]
+                  lambda_arn = props["LambdaFunctionArn"]
+                  s3 = boto3.client("s3")
+
+                  if request_type in ("Create", "Update"):
+                      config = {
+                          "LambdaFunctionConfigurations": [
+                              {
+                                  "LambdaFunctionArn": lambda_arn,
+                                  "Events": ["s3:ObjectCreated:*"],
+                                  "Filter": {
+                                      "Key": {
+                                          "FilterRules": [
+                                              {"Name": "suffix", "Value": ".htaccess"}
+                                          ]
+                                      }
+                                  },
+                              },
+                              {
+                                  "LambdaFunctionArn": lambda_arn,
+                                  "Events": ["s3:ObjectRemoved:*"],
+                                  "Filter": {
+                                      "Key": {
+                                          "FilterRules": [
+                                              {"Name": "suffix", "Value": ".htaccess"}
+                                          ]
+                                      }
+                                  },
+                              },
+                          ]
+                      }
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name, NotificationConfiguration=config
+                      )
+                  elif request_type == "Delete":
+                      # Best-effort: clear notifications so the bucket doesn't keep
+                      # referencing a Lambda that may be deleted alongside this stack.
+                      s3.put_bucket_notification_configuration(
+                          Bucket=bucket_name, NotificationConfiguration={}
+                      )
+
+                  send_response(event, context, "SUCCESS")
+              except Exception as exc:  # noqa: BLE001
+                  send_response(event, context, "FAILED", reason=str(exc))
+
+  BucketNotificationLogGroup:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${ProjectName}-bucket-notification-fn"
+      RetentionInDays: 7
+
+  ContentBucketNotification:
+    Type: Custom::S3BucketNotification
+    DependsOn:
+      - ContentBucketLambdaPermission
+    Properties:
+      ServiceToken: !GetAtt BucketNotificationFunction.Arn
+      BucketName: !Ref ContentBucket
+      LambdaFunctionArn: !GetAtt HtaccessBridgeFunction.Arn
+
+  # ---------------------------------------------------------------------
+  # CloudFront Functions viewer-request function
+  # ---------------------------------------------------------------------
+  HtaccessViewerRequestFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${ProjectName}-viewer-request"
+      FunctionConfig:
+        Comment: "htaccess bridge viewer-request function (basic redirect verification)"
+        Runtime: cloudfront-js-2.0
+        KeyValueStoreAssociations:
+          - KeyValueStoreARN: !GetAtt HtaccessConfigStore.Arn
+      AutoPublish: true
+      FunctionCode: |
+        import cf from 'cloudfront';
+        var kvs = cf.kvs();
+        var KVS_KEY_REDIRECTS_META = 'htaccess-redirects-meta';
+        var KVS_KEY_REDIRECTS_CHUNK_PREFIX = 'htaccess-redirects-';
+        var KVS_KEY_AUTH_SCOPES_META = 'htaccess-auth-scopes-meta';
+        var KVS_KEY_AUTH_SCOPES_CHUNK_PREFIX = 'htaccess-auth-scopes-';
+        var KVS_KEY_DIRECTORY_INDEX_META = 'htaccess-directory-index-meta';
+        var KVS_KEY_DIRECTORY_INDEX_CHUNK_PREFIX = 'htaccess-directory-index-';
+        var KVS_KEY_MAINTENANCE = 'htaccess-maintenance';
+
+        async function handler(event) {
+          var request = event.request;
+          var uri = request.uri || '/';
+
+          if (isBlockedPath(uri)) {
+            return { statusCode: 403, statusDescription: 'Forbidden' };
+          }
+
+          var config = await loadConfig();
+          var authScope = findAuthScope(uri, config);
+
+          if (authScope && !isAuthorized(event, request, authScope)) {
+            return unauthorized(authScope);
+          }
+
+          var redirect = findRedirect(uri, config.redirects || []);
+          if (redirect) {
+            return {
+              statusCode: redirect.status,
+              statusDescription: redirect.status === 301 ? 'Moved Permanently' : 'Found',
+              headers: { location: { value: redirect.location } }
+            };
+          }
+
+          request.uri = resolveIndexDocument(uri, config.directoryIndexScopes || []);
+          return request;
+        }
+
+        async function loadConfig() {
+          var results = await Promise.all([
+            loadBinPackedRules(KVS_KEY_REDIRECTS_META, KVS_KEY_REDIRECTS_CHUNK_PREFIX),
+            loadBinPackedRules(KVS_KEY_AUTH_SCOPES_META, KVS_KEY_AUTH_SCOPES_CHUNK_PREFIX),
+            loadBinPackedRules(KVS_KEY_DIRECTORY_INDEX_META, KVS_KEY_DIRECTORY_INDEX_CHUNK_PREFIX),
+            loadKvsJson(KVS_KEY_MAINTENANCE, { enabled: false, realm: 'Maintenance' })
+          ]);
+          return {
+            schemaVersion: 1,
+            redirects: results[0],
+            authScopes: results[1],
+            directoryIndexScopes: results[2],
+            maintenance: results[3]
+          };
+        }
+
+        async function loadBinPackedRules(metaKey, chunkPrefix) {
+          var meta = await loadKvsJson(metaKey, { chunkCount: 0 });
+          var chunkCount = meta.chunkCount || 0;
+          if (chunkCount === 0) {
+            return [];
+          }
+          var chunkPromises = [];
+          for (var i = 0; i < chunkCount; i++) {
+            chunkPromises.push(loadKvsJson(chunkPrefix + i, []));
+          }
+          var chunks = await Promise.all(chunkPromises);
+          var rules = [];
+          for (var j = 0; j < chunks.length; j++) {
+            rules = rules.concat(chunks[j]);
+          }
+          return rules;
+        }
+
+        async function loadKvsJson(key, fallback) {
+          try {
+            var raw = await kvs.get(key);
+            return JSON.parse(raw);
+          } catch (e) {
+            return fallback;
+          }
+        }
+
+        function isBlockedPath(uri) {
+          return uri === '/.htaccess' || endsWith(uri, '/.htaccess') ||
+            uri === '/.htpasswd' || endsWith(uri, '/.htpasswd') ||
+            uri.indexOf('/_control-history/') === 0;
+        }
+
+        function findAuthScope(uri, config) {
+          var scopes = config.authScopes || [];
+          for (var i = 0; i < scopes.length; i++) {
+            if (scopes[i].enabled && startsWith(uri, scopes[i].pathPrefix)) {
+              return scopes[i];
+            }
+          }
+          if (config.maintenance && config.maintenance.enabled) {
+            return config.maintenance;
+          }
+          return null;
+        }
+
+        function isAuthorized(event, request, maintenance) {
+          if (isAllowedViewerIp(event, maintenance.allowIps || [])) {
+            return true;
+          }
+          if (!maintenance.authorization) {
+            return false;
+          }
+          var headers = request.headers || {};
+          var auth = headers.authorization && headers.authorization.value;
+          return auth === maintenance.authorization;
+        }
+
+        function isAllowedViewerIp(event, allowIps) {
+          var viewerIp = event.viewer && event.viewer.ip;
+          if (!viewerIp || viewerIp.indexOf(':') !== -1) {
+            return false;
+          }
+          var viewerInt = ipv4ToInt(viewerIp);
+          if (viewerInt === null) {
+            return false;
+          }
+          for (var i = 0; i < allowIps.length; i++) {
+            if (ipv4InCidr(viewerInt, allowIps[i])) {
+              return true;
+            }
+          }
+          return false;
+        }
+
+        function ipv4InCidr(viewerInt, cidr) {
+          var parts = cidr.split('/');
+          var networkInt = ipv4ToInt(parts[0]);
+          if (networkInt === null) {
+            return false;
+          }
+          var prefix = parts.length > 1 ? parseInt(parts[1], 10) : 32;
+          if (prefix < 0 || prefix > 32) {
+            return false;
+          }
+          var mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+          return (viewerInt & mask) === (networkInt & mask);
+        }
+
+        function ipv4ToInt(ip) {
+          var parts = ip.split('.');
+          if (parts.length !== 4) {
+            return null;
+          }
+          var value = 0;
+          for (var i = 0; i < 4; i++) {
+            var part = parseInt(parts[i], 10);
+            if (isNaN(part) || part < 0 || part > 255 || String(part) !== parts[i]) {
+              return null;
+            }
+            value = ((value << 8) + part) >>> 0;
+          }
+          return value >>> 0;
+        }
+
+        function unauthorized(maintenance) {
+          var realm = maintenance.realm || 'Maintenance';
+          return {
+            statusCode: 401,
+            statusDescription: 'Unauthorized',
+            headers: {
+              'www-authenticate': { value: 'Basic realm="' + escapeRealm(realm) + '"' },
+              'cache-control': { value: 'no-store' }
+            }
+          };
+        }
+
+        function findRedirect(uri, rules) {
+          for (var i = 0; i < rules.length; i++) {
+            var rule = rules[i];
+            if (rule.type === 'redirect' && startsWith(uri, rule.from)) {
+              return { status: rule.status, location: appendRemainder(uri, rule.from, rule.to) };
+            }
+            if (rule.type === 'rewrite') {
+              var basePath = rule.basePath || '/';
+              if (!startsWith(uri, basePath)) {
+                continue;
+              }
+              var relativePath = basePath === '/' ? uri.substring(1) : uri.substring(basePath.length);
+              var re = new RegExp(rule.pattern);
+              if (re.test(relativePath)) {
+                return { status: rule.status, location: relativePath.replace(re, rule.to) };
+              }
+            }
+          }
+          return null;
+        }
+
+        function appendRemainder(uri, from, to) {
+          var remainder = uri.substring(from.length);
+          if (!remainder) return to;
+          if (to.charAt(to.length - 1) === '/' || remainder.charAt(0) === '/') return to + remainder;
+          return to + '/' + remainder;
+        }
+
+        function resolveIndexDocument(uri, directoryIndexScopes) {
+          if (uri !== '/' && uri.charAt(uri.length - 1) !== '/' && hasFileExtension(uri)) {
+            return uri;
+          }
+          var directoryPath = uri.charAt(uri.length - 1) === '/' ? uri : uri + '/';
+          var indexName = firstDirectoryIndexName(directoryPath, directoryIndexScopes) || 'index.html';
+          if (uri === '/') return '/' + indexName;
+          if (uri.charAt(uri.length - 1) === '/') return uri + indexName;
+          return uri + '/' + indexName;
+        }
+
+        function firstDirectoryIndexName(uri, directoryIndexScopes) {
+          for (var i = 0; i < directoryIndexScopes.length; i++) {
+            var scope = directoryIndexScopes[i];
+            if (startsWith(uri, scope.pathPrefix) && scope.names && scope.names.length > 0) {
+              return scope.names[0];
+            }
+          }
+          return null;
+        }
+
+        function hasFileExtension(uri) {
+          var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
+          var lastDotIndex = lastSegment.lastIndexOf('.');
+          if (lastDotIndex === -1) return false;
+          if (lastDotIndex === 0) return false;
+          if (lastDotIndex === lastSegment.length - 1) return false;
+          var extension = lastSegment.substring(lastDotIndex + 1);
+          return /^[A-Za-z0-9]{1,10}$/.test(extension);
+        }
+
+        function startsWith(value, prefix) {
+          return value.substring(0, prefix.length) === prefix;
+        }
+
+        function endsWith(value, suffix) {
+          return value.substring(value.length - suffix.length) === suffix;
+        }
+
+        function escapeRealm(value) {
+          return String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        }
+
+  # ---------------------------------------------------------------------
+  # CloudFront Distribution (default *.cloudfront.net domain, no custom domain/ACM)
+  # ---------------------------------------------------------------------
+  ContentBucketOAI:
+    Type: AWS::CloudFront::CloudFrontOriginAccessIdentity
+    Properties:
+      CloudFrontOriginAccessIdentityConfig:
+        Comment: !Sub "OAI for ${ProjectName} content bucket"
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        Comment: !Sub "${ProjectName} verification distribution"
+        DefaultRootObject: index.html
+        Origins:
+          - Id: ContentBucketOrigin
+            DomainName: !GetAtt ContentBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: !Sub "origin-access-identity/cloudfront/${ContentBucketOAI}"
+        DefaultCacheBehavior:
+          TargetOriginId: ContentBucketOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6 # Managed-CachingOptimized
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt HtaccessViewerRequestFunction.FunctionMetadata.FunctionARN
+        PriceClass: PriceClass_200
+
+  ContentBucketOAIPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ContentBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAIRead
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${ContentBucketOAI}"
+            Action: s3:GetObject
+            Resource: !Sub "${ContentBucket.Arn}/*"
+          - Sid: DenyInsecureTransport
+            Effect: Deny
+            Principal: "*"
+            Action: "s3:*"
+            Resource:
+              - !GetAtt ContentBucket.Arn
+              - !Sub "${ContentBucket.Arn}/*"
+            Condition:
+              Bool:
+                "aws:SecureTransport": "false"
+
+Outputs:
+  ContentBucketName:
+    Value: !Ref ContentBucket
+  DistributionDomainName:
+    Value: !GetAtt Distribution.DomainName
+  DistributionId:
+    Value: !Ref Distribution
+  KvsArn:
+    Value: !GetAtt HtaccessConfigStore.Arn
+  LambdaFunctionName:
+    Value: !Ref HtaccessBridgeFunction

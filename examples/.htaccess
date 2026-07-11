@@ -1,0 +1,15 @@
+# Maintenance mode
+AuthType Basic
+AuthName "Maintenance"
+Require valid-user
+Require ip 203.0.113.10 198.51.100.0/24
+
+# Redirects
+Redirect 301 /old/ /new/
+Redirect 302 /campaign-old/ /campaign/
+RedirectPermanent /legacy/ /new/
+RedirectTemp /tmp/ /maintenance/
+
+# Optional simple rewrite redirect
+RewriteEngine On
+RewriteRule ^docs/(.*)$ /manual/$1 [R=301,L]
