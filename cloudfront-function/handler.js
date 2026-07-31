@@ -117,6 +117,9 @@ function findAuthScope(uri, config) {
 }
 
 function isAuthorized(event, request, maintenance) {
+  if (maintenance.mode === 'ip') {
+    return isAllowedViewerIp(event, maintenance.allowIps || []);
+  }
   if (isAllowedViewerIp(event, maintenance.allowIps || [])) {
     return true;
   }

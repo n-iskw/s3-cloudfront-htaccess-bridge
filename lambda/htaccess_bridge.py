@@ -201,18 +201,21 @@ def build_site_config(
 
     for key, base_path, parsed in sorted(parsed_files, key=lambda item: (item[1].count("/"), item[1])):
         maintenance = parsed["maintenance"]
-        if maintenance["enabled"]:
+        if maintenance["enabled"] or maintenance.get("allowIps"):
             passwd_key = _htpasswd_key_for_scope(key)
             scope = {
                 "pathPrefix": base_path,
                 "enabled": True,
+                "mode": "basic" if maintenance["enabled"] else "ip",
                 "realm": maintenance.get("realm", "Maintenance"),
                 "allowIps": maintenance.get("allowIps", []),
                 "sourceKey": key,
             }
-            if passwd_key in parsed_htpasswd_files:
+            if maintenance["enabled"] and passwd_key in parsed_htpasswd_files:
                 scope["credentials"] = parsed_htpasswd_files[passwd_key]
             auth_scopes.append(scope)
+        if maintenance["enabled"]:
+            passwd_key = _htpasswd_key_for_scope(key)
             if base_path == "/":
                 root_maintenance = {
                     "enabled": True,
@@ -804,8 +807,11 @@ def _has_enabled_auth(config: Dict[str, Any]) -> bool:
 
 
 def _all_auth_scopes_have_credentials(config: Dict[str, Any]) -> bool:
-    scopes = [scope for scope in config.get("authScopes", []) if scope.get("enabled")]
-    return bool(scopes) and all(scope.get("credentials") for scope in scopes)
+    scopes = [
+        scope for scope in config.get("authScopes", [])
+        if scope.get("enabled") and scope.get("mode", "basic") == "basic"
+    ]
+    return all(scope.get("credentials") for scope in scopes)
 
 
 def _redact_credentials(config: Dict[str, Any]) -> Dict[str, Any]:
