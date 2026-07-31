@@ -11,5 +11,6 @@ __pycache__/
 
 # Local build artifacts
 *.zip
+node_modules/
 package/
 dist/

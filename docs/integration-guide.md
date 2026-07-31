@@ -18,6 +18,13 @@ CloudFront KeyValueStoreとCloudFront Functionsのリソースは`us-east-1`に�
 
 ### 1. リソースを作成
 
+CloudFront Functionは、読みやすい `cloudfront-function/handler.js` をminifyしてからテンプレートへ埋め込みます。初回または `handler.js` 更新時に生成してください。10 KBを超える場合はこのコマンドが失敗します。
+
+```bash
+npm ci
+npm run build:cloudfront-function
+```
+
 ```bash
 aws cloudformation deploy \
   --stack-name htaccess-bridge \
@@ -185,6 +192,13 @@ It does not modify the existing bucket notification configuration or Distributio
 Create the CloudFront KeyValueStore and CloudFront Functions resources in `us-east-1`, even when the existing S3 bucket is in another region.
 
 ### 1. Create bridge resources
+
+The template embeds a minified version of the readable `cloudfront-function/handler.js`. Run this before the first deployment and whenever `handler.js` changes. The command fails if the generated source reaches the 10 KB limit.
+
+```bash
+npm ci
+npm run build:cloudfront-function
+```
 
 ```bash
 aws cloudformation deploy \

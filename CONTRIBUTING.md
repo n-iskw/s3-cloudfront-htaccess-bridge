@@ -4,9 +4,12 @@ Contributions are welcome through issues and pull requests.
 
 ## Local checks
 
-The test suite has no third-party test dependencies:
+The Python and Node behavior tests have no third-party test dependencies. Install
+the pinned build dependency and regenerate the CloudFront artifact first:
 
 ```sh
+npm ci
+npm run build:cloudfront-function
 python3 -m unittest discover -s lambda -p 'test_*.py' -v
 node cloudfront-function/test_handler_logic.js
 ```

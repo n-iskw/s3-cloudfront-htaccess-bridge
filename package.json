@@ -1,0 +1,10 @@
+{
+  "private": true,
+  "scripts": {
+    "build:cloudfront-function": "node scripts/build-cloudfront-function.js",
+    "test:cloudfront-function": "node cloudfront-function/test_handler_logic.js"
+  },
+  "devDependencies": {
+    "terser": "5.43.1"
+  }
+}
