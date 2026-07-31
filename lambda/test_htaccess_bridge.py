@@ -82,6 +82,22 @@ class HtaccessBridgeTests(unittest.TestCase):
                 with self.assertRaises(HtaccessError):
                     parse_htaccess(htaccess)
 
+    def test_builds_ip_only_access_scope(self):
+        config = build_site_config([
+            (".htaccess", "Require ip 121.1.244.103 153.242.114.0 163.44.134.71")
+        ])
+        self.assertEqual(config["authScopes"][0]["mode"], "ip")
+        self.assertEqual(
+            config["authScopes"][0]["allowIps"],
+            ["121.1.244.103/32", "153.242.114.0/32", "163.44.134.71/32"],
+        )
+
+    def test_basic_auth_scope_keeps_ip_bypass_mode(self):
+        config = build_site_config([
+            (".htaccess", "AuthType Basic\nRequire valid-user\nRequire ip 203.0.113.10"),
+        ], htpasswd_files={".htpasswd": "preview:{SHA}nU4eI71bcnBGqeO0t9tXvY1u5oQ="})
+        self.assertEqual(config["authScopes"][0]["mode"], "basic")
+
     def test_rejects_unsupported_rewrite_features(self):
         cases = [
             "RewriteCond %{REQUEST_FILENAME} !-f",

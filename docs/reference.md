@@ -145,7 +145,7 @@ RewriteRule ^old/(.*)$ /new/$1 [R=301,L]
 | `AuthType Basic` | 対応 | `Require valid-user` と組み合わせて Basic 認証を有効化 |
 | `AuthName "..."` | 対応 | Basic 認証 realm として利用 |
 | `Require valid-user` | 対応 | そのスコープを保護対象にする |
-| `Require ip IPv4[/CIDR]` | 限定対応 | 同じメンテナンススコープで Basic 認証をバイパス |
+| `Require ip IPv4[/CIDR]` | 対応 | 単独指定時は一致IPだけ許可。Basic認証と併用時は一致IPが認証をバイパス |
 | `Redirect 301 from to` | 対応 | prefix redirect |
 | `Redirect 302 from to` | 対応 | prefix redirect |
 | `Redirect 307 from to` | 対応 | prefix redirect |
@@ -303,7 +303,7 @@ S3バージョニングが有効な場合、この例の現行オブジェクト
 
 - CloudFront Functions の関数を対象Cache Behaviorの `viewer-request` に関連付けてください。これにより `.htaccess`、`.htpasswd`、`_control-history` へのアクセスも403で拒否されます。
 - Basic 認証を使う場合は、同じディレクトリの `.htpasswd` が必須です。未配置または不正な更新は rejected になり、直前の有効設定が維持されます。
-- `Require ip` は Basic 認証のバイパス専用で、汎用アクセス制御ではありません。
+- `Require ip` 単独指定時は、指定IP以外を403で拒否します。Basic認証と併用した場合は、指定IPが認証をバイパスします。
 - KVSの反映には時間がかかる場合があります。設定更新後の確認は60〜90秒待ってください。
 - 必要に応じて、履歴とLambdaログにLifecycle／retentionを設定してください。
 
@@ -426,7 +426,7 @@ This bridge intentionally implements only the subset needed for maintenance mode
 | `AuthType Basic` | Yes | Enables Basic-auth maintenance when paired with `Require valid-user` |
 | `AuthName "..."` | Yes | Used as Basic auth realm |
 | `Require valid-user` | Yes | Marks that scope as protected |
-| `Require ip IPv4[/CIDR]` | Limited | Bypasses Basic auth for matching viewer IPs in the same maintenance scope |
+| `Require ip IPv4[/CIDR]` | Yes | Allows only matching IPs when used alone; bypasses Basic auth for matching IPs when combined with Basic auth |
 | `Redirect 301 from to` | Yes | Prefix redirect |
 | `Redirect 302 from to` | Yes | Prefix redirect |
 | `Redirect 307 from to` | Yes | Prefix redirect |
@@ -585,6 +585,6 @@ For a versioned bucket, expiring current objects as shown above does not remove 
 
 - Associate the function in CloudFront Functions with the target cache behavior's `viewer-request` event. It also returns 403 for `.htaccess`, `.htpasswd`, and `_control-history` URLs.
 - Basic auth requires `.htpasswd` in the same directory. Missing or invalid credentials are rejected and the last valid configuration remains active.
-- `Require ip` only bypasses Basic auth; it is not general-purpose access control.
+- When used alone, `Require ip` denies non-matching IPs with 403. When combined with Basic auth, matching IPs bypass authentication.
 - KVS propagation may take time. Wait 60–90 seconds after a configuration update before testing.
 - Configure S3 Lifecycle rules for history objects and Lambda log retention if needed.
