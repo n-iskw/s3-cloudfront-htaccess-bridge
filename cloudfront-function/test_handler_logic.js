@@ -6,6 +6,8 @@
 // dependency-free and avoid parsing the ES module import.
 
 var crypto = require('crypto');
+var fs = require('fs');
+var handlerSource = fs.readFileSync(__dirname + '/handler.js', 'utf8');
 
 function isAuthorizedWithCredentials(auth, credentials) {
   if (!auth || auth.substring(0, 6).toLowerCase() !== 'basic ') return false;
@@ -34,8 +36,29 @@ if (isAuthorizedWithCredentials('Basic ' + Buffer.from('preview:wrong').toString
   throw new Error('expected wrong password to be rejected');
 }
 
-if ({ statusCode: 403, statusDescription: 'Forbidden' }.statusCode !== 403) {
-  throw new Error('IP-only denial should return 403');
+if (handlerSource.indexOf("if (authScope.mode === 'ip')") === -1 ||
+    handlerSource.indexOf('return forbidden();') === -1) {
+  throw new Error('IP-only denial should use the forbidden response');
+}
+
+var forbiddenMatch = handlerSource.match(/function forbidden\(\) \{([\s\S]*?)\n\}/);
+if (!forbiddenMatch) {
+  throw new Error('forbidden response helper is missing');
+}
+var forbidden = eval('(function forbidden() {' + forbiddenMatch[1] + '\n})');
+var forbiddenResponse = forbidden();
+if (forbiddenResponse.statusCode !== 403 || forbiddenResponse.statusDescription !== 'Forbidden') {
+  throw new Error('IP-only denial should return 403 Forbidden');
+}
+
+var unauthorizedMatch = handlerSource.match(/function unauthorized\(maintenance\) \{([\s\S]*?)\n\}/);
+if (!unauthorizedMatch) {
+  throw new Error('unauthorized response helper is missing');
+}
+var escapeRealm = function (value) { return value; };
+var unauthorized = eval('(function unauthorized(maintenance) {' + unauthorizedMatch[1] + '\n})');
+if (unauthorized({ realm: 'Maintenance' }).statusCode !== 401) {
+  throw new Error('Basic auth denial should remain 401 Unauthorized');
 }
 
 function hasFileExtension(uri) {
