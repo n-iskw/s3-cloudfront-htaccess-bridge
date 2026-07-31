@@ -44,6 +44,13 @@ Build the Lambda deployment archive:
 ./scripts/build-lambda.sh
 ```
 
+Build the minified CloudFront Function before deploying the CloudFormation template:
+
+```sh
+npm ci
+npm run build:cloudfront-function
+```
+
 Run the tests:
 
 ```sh

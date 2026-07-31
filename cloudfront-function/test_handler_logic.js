@@ -8,6 +8,22 @@
 var crypto = require('crypto');
 var fs = require('fs');
 var handlerSource = fs.readFileSync(__dirname + '/handler.js', 'utf8');
+var minifiedSource = fs.readFileSync(__dirname + '/handler.min.js', 'utf8');
+var templateSource = fs.readFileSync(__dirname + '/../infra/bridge-resources.yaml', 'utf8');
+var maxFunctionBytes = 10 * 1024;
+var minifiedBytes = Buffer.byteLength(minifiedSource, 'utf8');
+if (minifiedBytes >= maxFunctionBytes) {
+  throw new Error('minified CloudFront Function exceeds 10 KB: ' + minifiedBytes + ' bytes');
+}
+if (!/\b(?:async )?function handler\b/.test(minifiedSource)) {
+  throw new Error('minified CloudFront Function must preserve the global handler entry point');
+}
+var indentedMinified = minifiedSource.trim().split('\n').map(function (line) {
+  return '        ' + line;
+}).join('\n');
+if (templateSource.indexOf(indentedMinified) === -1) {
+  throw new Error('CloudFormation template does not embed the current minified FunctionCode');
+}
 
 function isAuthorizedWithCredentials(auth, credentials) {
   if (!auth || auth.substring(0, 6).toLowerCase() !== 'basic ') return false;
