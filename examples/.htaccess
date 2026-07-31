@@ -5,6 +5,9 @@ AuthUserFile .htpasswd
 Require valid-user
 Require ip 203.0.113.10 198.51.100.0/24
 
+# Directory index (explicit opt-in)
+DirectoryIndex index.html
+
 # Redirects
 Redirect 301 /old/ /new/
 Redirect 302 /campaign-old/ /campaign/

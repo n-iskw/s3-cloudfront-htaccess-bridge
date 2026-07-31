@@ -277,6 +277,7 @@ class HtaccessBridgeTests(unittest.TestCase):
     def test_directory_index_disabled(self):
         config = parse_htaccess("DirectoryIndex disabled")
         self.assertEqual(config["directoryIndex"], [])
+        self.assertTrue(config["directoryIndexConfigured"])
 
     def test_multiple_directory_index_directives_add_to_list(self):
         config = parse_htaccess(
@@ -330,6 +331,18 @@ class HtaccessBridgeTests(unittest.TestCase):
         self.assertEqual(config["directoryIndexScopes"][0]["names"], ["portal.html", "index.html"])
         self.assertEqual(config["directoryIndexScopes"][1]["pathPrefix"], "/")
         self.assertEqual(config["directoryIndexScopes"][1]["names"], ["index.html"])
+
+    def test_does_not_build_directory_index_scope_without_directive(self):
+        config = build_site_config([(".htaccess", "Redirect 301 /old/ /new/")])
+        self.assertEqual(config["directoryIndexScopes"], [])
+
+    def test_builds_disabled_directory_index_scope(self):
+        config = build_site_config([(".htaccess", "DirectoryIndex disabled")])
+        self.assertEqual(config["directoryIndexScopes"], [{
+            "pathPrefix": "/",
+            "names": [],
+            "sourceKey": ".htaccess",
+        }])
 
 
 if __name__ == "__main__":

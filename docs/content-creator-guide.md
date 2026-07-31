@@ -80,7 +80,9 @@ DirectoryIndex index.html index.php
 
 複数指定した場合は、リストの先頭から順に候補として扱われます。ただしこの実装では実際にファイルが存在するかどうかを確認できないため、**常にリストの先頭のファイル名が使われます**。1番目の候補ファイルが実際に存在しない場合、404 になります（Apache のように2番目以降の候補へ自動フォールバックしません）。
 
-`DirectoryIndex` を設定していない場合は `index.html` が使われます。
+`DirectoryIndex` を設定していない場合、DirectoryIndex による書き換えは行われません。`index.html` を使う場合も、次のように `.htaccess` に明示的に記述してください。
+
+`DirectoryIndex disabled` を明示した場合は、そのディレクトリでは index 探索を行いません。
 
 ### 下位ディレクトリへの継承
 
@@ -191,7 +193,13 @@ DirectoryIndex index.html index.php
 
 When multiple names are given, they are treated as a priority list starting from the first one. However, this implementation cannot check whether a file actually exists, so **the first name in the list is always used**. If the first candidate file doesn't actually exist, the request returns 404 (there is no automatic fallback to the next candidate, unlike Apache).
 
-If `DirectoryIndex` is not set, `index.html` is used.
+If `DirectoryIndex` is not set, no DirectoryIndex rewrite is applied. To use `index.html`, declare it explicitly in `.htaccess`:
+
+```apache
+DirectoryIndex index.html
+```
+
+When `DirectoryIndex disabled` is declared, index lookup is disabled for that directory.
 
 ### Inheritance into Subdirectories
 

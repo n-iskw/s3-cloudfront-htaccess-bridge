@@ -265,8 +265,14 @@ function resolveIndexDocument(uri, directoryIndexScopes) {
     return uri;
   }
 
+  // DirectoryIndex is opt-in. A scope with an empty names list represents
+  // an explicit "DirectoryIndex disabled" and blocks inherited scopes.
   var directoryPath = uri.charAt(uri.length - 1) === '/' ? uri : uri + '/';
-  var indexName = firstDirectoryIndexName(directoryPath, directoryIndexScopes) || 'index.html';
+  var directoryIndexScope = findDirectoryIndexScope(directoryPath, directoryIndexScopes);
+  if (!directoryIndexScope || !directoryIndexScope.names || directoryIndexScope.names.length === 0) {
+    return uri;
+  }
+  var indexName = directoryIndexScope.names[0];
 
   if (uri === '/') {
     return '/' + indexName;
@@ -284,11 +290,11 @@ function resolveIndexDocument(uri, directoryIndexScopes) {
 // fallback" note in README.md for the same limitation), so this is a
 // simplified reproduction: it always uses the FIRST name in the most
 // specific matching scope's list, without checking whether it exists.
-function firstDirectoryIndexName(uri, directoryIndexScopes) {
+function findDirectoryIndexScope(uri, directoryIndexScopes) {
   for (var i = 0; i < directoryIndexScopes.length; i++) {
     var scope = directoryIndexScopes[i];
-    if (startsWith(uri, scope.pathPrefix) && scope.names && scope.names.length > 0) {
-      return scope.names[0];
+    if (startsWith(uri, scope.pathPrefix)) {
+      return scope;
     }
   }
   return null;

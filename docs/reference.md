@@ -32,7 +32,7 @@ hidden file block
 - パス単位のリダイレクト
 - Basic 認証によるメンテナンスモード
 - メンテナンス中の確認用 IP バイパス
-- ディレクトリアクセス時のデフォルトドキュメント配信（Apache の `DirectoryIndex` 相当。`.htaccess` でファイル名の優先順位リストを指定できるが、実在確認はできず常にリストの先頭を使う）
+- `.htaccess` に明示した場合のディレクトリアクセス時のデフォルトドキュメント配信（Apache の `DirectoryIndex` 相当。実在確認はできず常にリストの先頭を使う）
 
 SPA（Single Page Application）のクライアントサイドルーティング用フォールバック（存在しないパスをすべて `index.html` に落とす動作。Apache の `RewriteCond %{REQUEST_FILENAME} !-f` や `FallbackResource` に相当）は対象外です。理由は「対応しない Apache 機能」節を参照してください。
 
@@ -104,7 +104,7 @@ Lambda ZIP のビルド:
 ```text
 /.htaccess       -> 403
 /old/foo.html    -> 301 /new/foo.html
-/                -> /index.html origin request
+DirectoryIndex index.html がある場合: / -> /index.html origin request
 maintenance ON   -> Basic auth, except allowed IPs
 ```
 
@@ -158,7 +158,7 @@ RewriteRule ^old/(.*)$ /new/$1 [R=301,L]
 | `RewriteRule pattern target [R=302,L]` | 限定対応 | redirect のみ |
 | nested `RewriteRule` relative matching | 対応 | `.htaccess` が置かれたディレクトリからの相対パスで評価 |
 | `DirectoryIndex local-url [local-url] ...` | 限定対応 | 複数ファイル名を優先順位付きで指定可能。ただし実在確認ができないため常にリストの最初の名前を使う（詳細は下記の注意事項を参照） |
-| `DirectoryIndex disabled` | 限定対応 | この実装では index 探索の完全な無効化はできない。`.htaccess` に `DirectoryIndex disabled` を設定した場合、そのスコープではデフォルトの `index.html` にフォールバックする（Apache 本来の「一覧表示または 404」とは異なる） |
+| `DirectoryIndex disabled` | 限定対応 | そのスコープでは index 探索を行わない。親スコープの設定も適用しない |
 
 #### 非対応
 
@@ -206,6 +206,8 @@ SPA（React Router、Vue Router 等のクライアントサイドルーティン
 Apache では `RewriteCond %{REQUEST_FILENAME} !-f` と `RewriteRule` の組み合わせ、または `FallbackResource` ディレクティブでこの動作を実現しますが、いずれもサーバー側でファイルシステムに実在するかどうかを判定する処理に依存します。この実装のアーキテクチャでは、この判定を再現できません。
 
 `DirectoryIndex` も同様にファイル実在確認を前提とするディレクティブですが（Apache は複数の候補ファイルのうち実在する最初の1つを返す）、こちらは限定的に対応しています。候補が複数存在する状況（`RewriteCond`/`FallbackResource` が扱う「あらゆる存在しないパス」という無限の空間）と比べ、`DirectoryIndex` は「同じディレクトリ内の少数の候補ファイル名」という限定された空間であるため、実在確認をせず「常にリストの先頭を使う」という簡略化を行っても実用上の破綻が少ないという判断です。この簡略化の結果、`.htaccess` で指定した1番目の候補ファイルが実際に存在しない場合、404 になります（Apache のように2番目以降の候補へ自動フォールバックしません）。
+
+この実装では `DirectoryIndex` は明示的なオプトインです。`.htaccess` に指定がなければ URI は書き換えられず、`DirectoryIndex disabled` を指定したスコープでは親スコープの設定も適用されません。
 
 - Lambda（`htaccess_bridge.py`）は `.htaccess` の内容を静的に解析するだけで、コンテンツバケットのオブジェクト一覧とは無関係に動作します
 - CloudFront Functions（`handler.js`）は毎リクエストで実行されますが、S3 オリジンへの事前フェッチができない軽量実行環境です（[CloudFront Functions の制約](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cloudfront-function-restrictions.html)を参照）
@@ -326,7 +328,7 @@ It is intended for static sites migrated from Apache to S3 + CloudFront where co
 - path redirects
 - Basic-auth maintenance mode
 - IP bypass during maintenance review
-- serving a default document on directory access (equivalent to Apache's `DirectoryIndex`; `.htaccess` can specify a priority list of filenames, but existence is not checked so the first name is always used)
+- serving a default document on directory access when explicitly declared in `.htaccess` (equivalent to Apache's `DirectoryIndex`; existence is not checked so the first name is always used)
 
 SPA (Single Page Application) client-side routing fallback (rewriting every non-existent path to `index.html` so the client-side router can handle it) is out of scope. See "About SPA fallback" for details.
 
@@ -386,7 +388,7 @@ Steps for building from scratch:
 ```text
 /.htaccess       -> 403
 /old/foo.html    -> 301 /new/foo.html
-/                -> /index.html origin request
+With DirectoryIndex index.html: / -> /index.html origin request
 maintenance ON   -> Basic auth, except allowed IPs
 ```
 
@@ -439,7 +441,7 @@ This bridge intentionally implements only the subset needed for maintenance mode
 | `RewriteRule pattern target [R=302,L]` | Limited | Redirect only |
 | nested `RewriteRule` relative matching | Yes | Pattern is evaluated relative to the `.htaccess` directory |
 | `DirectoryIndex local-url [local-url] ...` | Limited | Multiple candidate filenames can be specified in priority order. Existence cannot be checked, so the first name in the list is always used (see the note below) |
-| `DirectoryIndex disabled` | Limited | This implementation cannot fully disable index lookup. With `DirectoryIndex disabled`, the scope falls back to the default `index.html` (different from Apache's "listing or 404" behavior) |
+| `DirectoryIndex disabled` | Limited | Disables index lookup in that scope and prevents an inherited DirectoryIndex scope from applying |
 
 #### Not Supported
 
@@ -488,6 +490,8 @@ SPA client-side routing fallback (rewriting every non-existent path to `index.ht
 Apache implements this with `RewriteCond %{REQUEST_FILENAME} !-f` combined with `RewriteRule`, or with the `FallbackResource` directive. Both depend on the server checking whether a path exists on the filesystem. This implementation's architecture cannot reproduce that check.
 
 `DirectoryIndex` has a similar existence-check dependency (Apache serves the first candidate file that actually exists), but is supported in a limited form. Unlike `RewriteCond`/`FallbackResource`, which need to handle "any non-existent path" (an unbounded space), `DirectoryIndex` only deals with a small, fixed set of candidate filenames in the same directory. Skipping the existence check and always using the first candidate is a simplification that stays practical in that narrower scope. As a result, if the first candidate filename doesn't actually exist, the request returns 404 (there is no automatic fallback to the next candidate, unlike Apache).
+
+In this implementation, `DirectoryIndex` is an explicit opt-in. If it is absent from `.htaccess`, the URI is left unchanged. A scope with `DirectoryIndex disabled` also prevents an inherited DirectoryIndex scope from applying.
 
 - Lambda (`htaccess_bridge.py`) only statically parses `.htaccess` content; it has no visibility into the content bucket's object listing
 - CloudFront Functions (`handler.js`) run on every request but cannot pre-fetch the S3 origin (see [CloudFront Functions restrictions](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/cloudfront-function-restrictions.html))

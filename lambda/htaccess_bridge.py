@@ -67,6 +67,7 @@ def parse_htaccess(
     rewrite_engine_on = False
     directory_index: List[str] = []
     directory_index_disabled = False
+    directory_index_configured = False
     auth_user_file: Optional[str] = None
 
     for line in parsed_lines:
@@ -124,6 +125,7 @@ def parse_htaccess(
             redirects.append(_parse_rewrite_rule(line, allowed_hosts))
 
         elif name == "directoryindex":
+            directory_index_configured = True
             directory_index, directory_index_disabled = _apply_directory_index(
                 line, directory_index, directory_index_disabled
             )
@@ -138,6 +140,7 @@ def parse_htaccess(
         "maintenance": maintenance,
         "redirects": redirects,
         "directoryIndex": [] if directory_index_disabled else directory_index,
+        "directoryIndexConfigured": directory_index_configured,
     }
     validate_config(config)
     return config
@@ -225,7 +228,7 @@ def build_site_config(
                 if passwd_key in parsed_htpasswd_files:
                     root_maintenance["credentials"] = parsed_htpasswd_files[passwd_key]
 
-        if parsed.get("directoryIndex"):
+        if parsed.get("directoryIndexConfigured"):
             directory_index_scopes.append(
                 {
                     "pathPrefix": base_path,
