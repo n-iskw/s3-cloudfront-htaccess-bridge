@@ -2,13 +2,6 @@ import cf from 'cloudfront';
 import crypto from 'crypto';
 
 var kvs = cf.kvs();
-var KVS_KEY_REDIRECTS_META = 'htaccess-redirects-meta';
-var KVS_KEY_REDIRECTS_CHUNK_PREFIX = 'htaccess-redirects-';
-var KVS_KEY_AUTH_SCOPES_META = 'htaccess-auth-scopes-meta';
-var KVS_KEY_AUTH_SCOPES_CHUNK_PREFIX = 'htaccess-auth-scopes-';
-var KVS_KEY_DIRECTORY_INDEX_META = 'htaccess-directory-index-meta';
-var KVS_KEY_DIRECTORY_INDEX_CHUNK_PREFIX = 'htaccess-directory-index-';
-var KVS_KEY_MAINTENANCE = 'htaccess-maintenance';
 
 async function handler(event) {
   var request = event.request;
@@ -48,13 +41,12 @@ async function handler(event) {
 
 async function loadConfig() {
   var results = await Promise.all([
-    loadBinPackedRules(KVS_KEY_REDIRECTS_META, KVS_KEY_REDIRECTS_CHUNK_PREFIX),
-    loadBinPackedRules(KVS_KEY_AUTH_SCOPES_META, KVS_KEY_AUTH_SCOPES_CHUNK_PREFIX),
-    loadBinPackedRules(KVS_KEY_DIRECTORY_INDEX_META, KVS_KEY_DIRECTORY_INDEX_CHUNK_PREFIX),
-    loadKvsJson(KVS_KEY_MAINTENANCE, { enabled: false, realm: 'Maintenance' }),
+    loadBinPackedRules('redirects'),
+    loadBinPackedRules('auth-scopes'),
+    loadBinPackedRules('directory-index'),
+    loadKvsJson('htaccess-maintenance', { enabled: false, realm: 'Maintenance' }),
   ]);
   return {
-    schemaVersion: 1,
     redirects: results[0],
     authScopes: results[1],
     directoryIndexScopes: results[2],
@@ -71,15 +63,15 @@ async function loadConfig() {
 // key records how many chunks exist so they can all be fetched in
 // parallel in one extra round trip, rather than probing key names one at
 // a time.
-async function loadBinPackedRules(metaKey, chunkPrefix) {
-  var meta = await loadKvsJson(metaKey, { chunkCount: 0 });
-  var chunkCount = meta.chunkCount || 0;
-  if (chunkCount === 0) {
+async function loadBinPackedRules(name) {
+  var keyPrefix = 'htaccess-' + name;
+  var chunkCount = (await loadKvsJson(keyPrefix + '-meta', { chunkCount: 0 })).chunkCount || 0;
+  if (!chunkCount) {
     return [];
   }
   var chunkPromises = [];
   for (var i = 0; i < chunkCount; i++) {
-    chunkPromises.push(loadKvsJson(chunkPrefix + i, []));
+    chunkPromises.push(loadKvsJson(keyPrefix + '-' + i, []));
   }
   var chunks = await Promise.all(chunkPromises);
   var rules = [];
@@ -91,30 +83,29 @@ async function loadBinPackedRules(metaKey, chunkPrefix) {
 
 async function loadKvsJson(key, fallback) {
   try {
-    var raw = await kvs.get(key);
-    return JSON.parse(raw);
+    return JSON.parse(await kvs.get(key));
   } catch (e) {
     return fallback;
   }
 }
 
 function isBlockedPath(uri) {
-  return uri === '/.htaccess' ||
-    uri === '/.htpasswd' ||
-    uri.indexOf('/_control-history/') === 0 ||
+  return startsWith(uri, '/_control-history/') ||
     endsWith(uri, '/.htaccess') ||
     endsWith(uri, '/.htpasswd');
 }
 
 function findAuthScope(uri, config) {
-  var scopes = config.authScopes || [];
+  var scope = findScope(uri, config.authScopes || [], true);
+  return scope || (config.maintenance && config.maintenance.enabled ? config.maintenance : null);
+}
+
+function findScope(uri, scopes, requireEnabled) {
   for (var i = 0; i < scopes.length; i++) {
-    if (scopes[i].enabled && startsWith(uri, scopes[i].pathPrefix)) {
-      return scopes[i];
+    var scope = scopes[i];
+    if ((!requireEnabled || scope.enabled) && startsWith(uri, scope.pathPrefix)) {
+      return scope;
     }
-  }
-  if (config.maintenance && config.maintenance.enabled) {
-    return config.maintenance;
   }
   return null;
 }
@@ -197,7 +188,7 @@ function ipv4ToInt(ip) {
     }
     value = ((value << 8) + part) >>> 0;
   }
-  return value >>> 0;
+  return value;
 }
 
 function unauthorized(maintenance) {
@@ -251,36 +242,24 @@ function findRedirect(uri, rules) {
 
 function appendRemainder(uri, from, to) {
   var remainder = uri.substring(from.length);
-  if (!remainder) {
-    return to;
-  }
-  if (to.charAt(to.length - 1) === '/' || remainder.charAt(0) === '/') {
-    return to + remainder;
-  }
-  return to + '/' + remainder;
+  var separator = remainder && !endsWith(to, '/') && !startsWith(remainder, '/') ? '/' : '';
+  return to + separator + remainder;
 }
 
 function resolveIndexDocument(uri, directoryIndexScopes) {
-  if (uri !== '/' && uri.charAt(uri.length - 1) !== '/' && hasFileExtension(uri)) {
+  var hasTrailingSlash = endsWith(uri, '/');
+  if (!hasTrailingSlash && hasFileExtension(uri)) {
     return uri;
   }
 
   // DirectoryIndex is opt-in. A scope with an empty names list represents
   // an explicit "DirectoryIndex disabled" and blocks inherited scopes.
-  var directoryPath = uri.charAt(uri.length - 1) === '/' ? uri : uri + '/';
-  var directoryIndexScope = findDirectoryIndexScope(directoryPath, directoryIndexScopes);
+  var directoryPath = hasTrailingSlash ? uri : uri + '/';
+  var directoryIndexScope = findScope(directoryPath, directoryIndexScopes, false);
   if (!directoryIndexScope || !directoryIndexScope.names || directoryIndexScope.names.length === 0) {
     return uri;
   }
-  var indexName = directoryIndexScope.names[0];
-
-  if (uri === '/') {
-    return '/' + indexName;
-  }
-  if (uri.charAt(uri.length - 1) === '/') {
-    return uri + indexName;
-  }
-  return uri + '/' + indexName;
+  return uri + (hasTrailingSlash ? '' : '/') + directoryIndexScope.names[0];
 }
 
 // Apache's DirectoryIndex lets a .htaccess declare a priority list of
@@ -290,42 +269,13 @@ function resolveIndexDocument(uri, directoryIndexScopes) {
 // fallback" note in README.md for the same limitation), so this is a
 // simplified reproduction: it always uses the FIRST name in the most
 // specific matching scope's list, without checking whether it exists.
-function findDirectoryIndexScope(uri, directoryIndexScopes) {
-  for (var i = 0; i < directoryIndexScopes.length; i++) {
-    var scope = directoryIndexScopes[i];
-    if (startsWith(uri, scope.pathPrefix)) {
-      return scope;
-    }
-  }
-  return null;
-}
-
 function hasFileExtension(uri) {
   var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
   var lastDotIndex = lastSegment.lastIndexOf('.');
 
-  // No dot in the last segment: definitely not a file extension.
-  if (lastDotIndex === -1) {
-    return false;
-  }
-  // Dot at position 0 means the segment is a dotfile (e.g. ".well-known"),
-  // not an extension.
-  if (lastDotIndex === 0) {
-    return false;
-  }
-  // Dot at the very end (e.g. "foo.") has no extension characters after it.
-  if (lastDotIndex === lastSegment.length - 1) {
-    return false;
-  }
-
-  var extension = lastSegment.substring(lastDotIndex + 1);
-  // A real file extension is a short run of alphanumeric characters
-  // (e.g. html, css, js, json, png, woff2). Reject anything that doesn't
-  // look like one, so segments such as "v1.2" or "file.name.with.dots"
-  // (final segment ending in a dictionary word, not a known extension)
-  // are treated as extensionless when the trailing token isn't a plausible
-  // extension pattern.
-  return /^[A-Za-z0-9]{1,10}$/.test(extension);
+  // Dotfiles are not extensions. The pattern also rejects a trailing dot
+  // and limits extensions to short alphanumeric names.
+  return lastDotIndex > 0 && /^[A-Za-z0-9]{1,10}$/.test(lastSegment.substring(lastDotIndex + 1));
 }
 
 function startsWith(value, prefix) {

@@ -1,9 +1,5 @@
-// Minimal Node-based tests for the hasFileExtension()/resolveIndexDocument()
-// logic in handler.js. CloudFront Functions runtime is not Node, but this
-// logic is plain ES5-ish JS with no CloudFront-specific APIs, so it can be
-// unit tested by extracting the function bodies via regex and eval, or by
-// duplicating the pure logic here. We duplicate here to keep this test
-// dependency-free and avoid parsing the ES module import.
+// Minimal Node-based tests for pure logic in handler.js. CloudFront Functions
+// runtime is not Node, so the pure function bodies are extracted for testing.
 
 var crypto = require('crypto');
 var fs = require('fs');
@@ -57,6 +53,59 @@ if (handlerSource.indexOf("if (authScope.mode === 'ip')") === -1 ||
   throw new Error('IP-only denial should use the forbidden response');
 }
 
+var blockedPathMatch = handlerSource.match(/function isBlockedPath\(uri\) \{([\s\S]*?)\n\}/);
+if (!blockedPathMatch) {
+  throw new Error('blocked-path helper is missing');
+}
+var startsWith = function (value, prefix) {
+  return value.substring(0, prefix.length) === prefix;
+};
+var endsWith = function (value, suffix) {
+  return value.substring(value.length - suffix.length) === suffix;
+};
+
+function extractFunction(name, parameters) {
+  var match = handlerSource.match(new RegExp('function ' + name + '\\([^)]*\\) \\{([\\s\\S]*?)\\n\\}'));
+  if (!match) {
+    throw new Error(name + ' helper is missing');
+  }
+  return eval('(function ' + name + '(' + parameters + ') {' + match[1] + '\n})');
+}
+
+var isBlockedPath = eval('(function isBlockedPath(uri) {' + blockedPathMatch[1] + '\n})');
+var blockedPathCases = [
+  ['/.htaccess', true],
+  ['/.htpasswd', true],
+  ['/_control-history/published/config.json', true],
+  ['/members/.htaccess', true],
+  ['/members/.htpasswd', true],
+  ['/members/.htaccess.bak', false],
+  ['/public/index.html', false],
+];
+blockedPathCases.forEach(function (testCase) {
+  if (isBlockedPath(testCase[0]) !== testCase[1]) {
+    throw new Error('unexpected blocked-path result for ' + testCase[0]);
+  }
+});
+
+var findScope = extractFunction('findScope', 'uri, scopes, requireEnabled');
+var scopeCases = [
+  ['/members/page', [
+    { pathPrefix: '/members/', enabled: false },
+    { pathPrefix: '/', enabled: true },
+  ], true, '/'],
+  ['/members/page', [
+    { pathPrefix: '/members/', enabled: false },
+    { pathPrefix: '/', enabled: true },
+  ], false, '/members/'],
+];
+scopeCases.forEach(function (testCase) {
+  var scope = findScope(testCase[0], testCase[1], testCase[2]);
+  if (!scope || scope.pathPrefix !== testCase[3]) {
+    throw new Error('unexpected scope result for ' + testCase[0]);
+  }
+});
+
 var forbiddenMatch = handlerSource.match(/function forbidden\(\) \{([\s\S]*?)\n\}/);
 if (!forbiddenMatch) {
   throw new Error('forbidden response helper is missing');
@@ -77,52 +126,22 @@ if (unauthorized({ realm: 'Maintenance' }).statusCode !== 401) {
   throw new Error('Basic auth denial should remain 401 Unauthorized');
 }
 
-function hasFileExtension(uri) {
-  var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
-  var lastDotIndex = lastSegment.lastIndexOf('.');
+var hasFileExtension = extractFunction('hasFileExtension', 'uri');
+var resolveIndexDocument = extractFunction('resolveIndexDocument', 'uri, directoryIndexScopes');
+var appendRemainder = extractFunction('appendRemainder', 'uri, from, to');
 
-  if (lastDotIndex === -1) {
-    return false;
+var appendRemainderCases = [
+  ['/old', '/old', '/new', '/new'],
+  ['/old/path', '/old/', '/new/', '/new/path'],
+  ['/old/path', '/old', '/new', '/new/path'],
+  ['/old/path', '/old/', '/new', '/new/path'],
+];
+appendRemainderCases.forEach(function (testCase) {
+  var actual = appendRemainder(testCase[0], testCase[1], testCase[2]);
+  if (actual !== testCase[3]) {
+    throw new Error('unexpected redirect remainder result: ' + actual);
   }
-  if (lastDotIndex === 0) {
-    return false;
-  }
-  if (lastDotIndex === lastSegment.length - 1) {
-    return false;
-  }
-
-  var extension = lastSegment.substring(lastDotIndex + 1);
-  return /^[A-Za-z0-9]{1,10}$/.test(extension);
-}
-
-function resolveIndexDocument(uri, directoryIndexScopes) {
-  if (uri !== '/' && uri.charAt(uri.length - 1) !== '/' && hasFileExtension(uri)) {
-    return uri;
-  }
-  var directoryPath = uri.charAt(uri.length - 1) === '/' ? uri : uri + '/';
-  var directoryIndexScope = findDirectoryIndexScope(directoryPath, directoryIndexScopes || []);
-  if (!directoryIndexScope || !directoryIndexScope.names || directoryIndexScope.names.length === 0) {
-    return uri;
-  }
-  var indexName = directoryIndexScope.names[0];
-  if (uri === '/') {
-    return '/' + indexName;
-  }
-  if (uri.charAt(uri.length - 1) === '/') {
-    return uri + indexName;
-  }
-  return uri + '/' + indexName;
-}
-
-function findDirectoryIndexScope(uri, directoryIndexScopes) {
-  for (var i = 0; i < directoryIndexScopes.length; i++) {
-    var scope = directoryIndexScopes[i];
-    if (uri.substring(0, scope.pathPrefix.length) === scope.pathPrefix) {
-      return scope;
-    }
-  }
-  return null;
-}
+});
 
 var cases = [
   // [uri, directoryIndexScopes, expectedResolved]
@@ -224,11 +243,6 @@ for (var i = 0; i < cases.length; i++) {
 // (rather than imported) for the same dependency-free reasons as above;
 // kvs.get() is replaced with a mock so this can run outside the CloudFront
 // Functions runtime.
-var KVS_KEY_REDIRECTS_META = 'htaccess-redirects-meta';
-var KVS_KEY_REDIRECTS_CHUNK_PREFIX = 'htaccess-redirects-';
-var KVS_KEY_DIRECTORY_INDEX_META = 'htaccess-directory-index-meta';
-var KVS_KEY_DIRECTORY_INDEX_CHUNK_PREFIX = 'htaccess-directory-index-';
-
 function makeMockKvs(store) {
   return {
     get: function (key) {
@@ -252,15 +266,15 @@ async function loadKvsJsonWith(kvs, key, fallback) {
   }
 }
 
-async function loadBinPackedRulesWith(kvs, metaKey, chunkPrefix) {
-  var meta = await loadKvsJsonWith(kvs, metaKey, { chunkCount: 0 });
-  var chunkCount = meta.chunkCount || 0;
-  if (chunkCount === 0) {
+async function loadBinPackedRulesWith(kvs, name) {
+  var keyPrefix = 'htaccess-' + name;
+  var chunkCount = (await loadKvsJsonWith(kvs, keyPrefix + '-meta', { chunkCount: 0 })).chunkCount || 0;
+  if (!chunkCount) {
     return [];
   }
   var chunkPromises = [];
   for (var i = 0; i < chunkCount; i++) {
-    chunkPromises.push(loadKvsJsonWith(kvs, chunkPrefix + i, []));
+    chunkPromises.push(loadKvsJsonWith(kvs, keyPrefix + '-' + i, []));
   }
   var chunks = await Promise.all(chunkPromises);
   var rules = [];
@@ -275,7 +289,7 @@ async function runLoadRedirectsTests() {
   // ever published) falls back to chunkCount 0, yielding an empty list
   // without attempting to fetch any chunk key.
   var noMetaKvs = makeMockKvs({});
-  var noMetaResult = await loadBinPackedRulesWith(noMetaKvs, KVS_KEY_REDIRECTS_META, KVS_KEY_REDIRECTS_CHUNK_PREFIX);
+  var noMetaResult = await loadBinPackedRulesWith(noMetaKvs, 'redirects');
   if (JSON.stringify(noMetaResult) !== '[]') {
     console.log('FAIL loadRedirects (no meta key): expected [], got ' + JSON.stringify(noMetaResult));
     failures++;
@@ -286,7 +300,7 @@ async function runLoadRedirectsTests() {
     'htaccess-redirects-meta': JSON.stringify({ chunkCount: 1 }),
     'htaccess-redirects-0': JSON.stringify([{ from: '/old/', to: '/new/', status: 301 }])
   });
-  var singleChunkResult = await loadBinPackedRulesWith(singleChunkKvs, KVS_KEY_REDIRECTS_META, KVS_KEY_REDIRECTS_CHUNK_PREFIX);
+  var singleChunkResult = await loadBinPackedRulesWith(singleChunkKvs, 'redirects');
   if (singleChunkResult.length !== 1 || singleChunkResult[0].from !== '/old/') {
     console.log('FAIL loadRedirects (single chunk): got ' + JSON.stringify(singleChunkResult));
     failures++;
@@ -299,7 +313,7 @@ async function runLoadRedirectsTests() {
     'htaccess-redirects-1': JSON.stringify([{ from: '/b/', to: '/b2/', status: 301 }]),
     'htaccess-redirects-2': JSON.stringify([{ from: '/c/', to: '/c2/', status: 301 }])
   });
-  var multiChunkResult = await loadBinPackedRulesWith(multiChunkKvs, KVS_KEY_REDIRECTS_META, KVS_KEY_REDIRECTS_CHUNK_PREFIX);
+  var multiChunkResult = await loadBinPackedRulesWith(multiChunkKvs, 'redirects');
   var multiChunkFroms = multiChunkResult.map(function (r) { return r.from; }).join(',');
   if (multiChunkFroms !== '/a/,/b/,/c/') {
     console.log('FAIL loadRedirects (multi chunk order): expected /a/,/b/,/c/, got ' + multiChunkFroms);
@@ -315,7 +329,7 @@ async function runLoadRedirectsTests() {
     'htaccess-redirects-0': JSON.stringify([{ from: '/a/', to: '/a2/', status: 301 }])
     // htaccess-redirects-1 intentionally absent
   });
-  var missingChunkResult = await loadBinPackedRulesWith(missingChunkKvs, KVS_KEY_REDIRECTS_META, KVS_KEY_REDIRECTS_CHUNK_PREFIX);
+  var missingChunkResult = await loadBinPackedRulesWith(missingChunkKvs, 'redirects');
   if (missingChunkResult.length !== 1 || missingChunkResult[0].from !== '/a/') {
     console.log('FAIL loadRedirects (missing chunk falls back to empty): got ' + JSON.stringify(missingChunkResult));
     failures++;
@@ -330,16 +344,15 @@ async function runLoadRedirectsTests() {
     'htaccess-directory-index-0': JSON.stringify([{ pathPrefix: '/', names: ['index.html'] }]),
     'htaccess-directory-index-1': JSON.stringify([{ pathPrefix: '/section-0/', names: ['section0-index.html'] }])
   });
-  var dirIndexResult = await loadBinPackedRulesWith(
-    dirIndexKvs, KVS_KEY_DIRECTORY_INDEX_META, KVS_KEY_DIRECTORY_INDEX_CHUNK_PREFIX
-  );
+  var dirIndexResult = await loadBinPackedRulesWith(dirIndexKvs, 'directory-index');
   var dirIndexPrefixes = dirIndexResult.map(function (r) { return r.pathPrefix; }).join(',');
   if (dirIndexPrefixes !== '/,/section-0/') {
     console.log('FAIL loadBinPackedRulesWith (directory-index key names): expected /,/section-0/, got ' + dirIndexPrefixes);
     failures++;
   }
 
-  var totalCases = hasFileExtensionCases.length + cases.length + 5;
+  var totalCases = hasFileExtensionCases.length + cases.length + blockedPathCases.length +
+    scopeCases.length + appendRemainderCases.length + 5;
   if (failures === 0) {
     console.log('All ' + totalCases + ' cases passed.');
     process.exit(0);
