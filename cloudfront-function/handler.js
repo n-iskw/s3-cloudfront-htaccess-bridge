@@ -25,6 +25,9 @@ async function handler(event) {
   var authScope = findAuthScope(uri, config);
 
   if (authScope && !isAuthorized(event, request, authScope)) {
+    if (authScope.mode === 'ip') {
+      return forbidden();
+    }
     return unauthorized(authScope);
   }
 
@@ -204,6 +207,16 @@ function unauthorized(maintenance) {
     statusDescription: 'Unauthorized',
     headers: {
       'www-authenticate': { value: 'Basic realm="' + escapeRealm(realm) + '"' },
+      'cache-control': { value: 'no-store' }
+    }
+  };
+}
+
+function forbidden() {
+  return {
+    statusCode: 403,
+    statusDescription: 'Forbidden',
+    headers: {
       'cache-control': { value: 'no-store' }
     }
   };

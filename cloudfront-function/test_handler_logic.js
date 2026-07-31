@@ -34,6 +34,10 @@ if (isAuthorizedWithCredentials('Basic ' + Buffer.from('preview:wrong').toString
   throw new Error('expected wrong password to be rejected');
 }
 
+if ({ statusCode: 403, statusDescription: 'Forbidden' }.statusCode !== 403) {
+  throw new Error('IP-only denial should return 403');
+}
+
 function hasFileExtension(uri) {
   var lastSegment = uri.substring(uri.lastIndexOf('/') + 1);
   var lastDotIndex = lastSegment.lastIndexOf('.');
