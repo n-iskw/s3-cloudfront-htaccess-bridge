@@ -60,7 +60,7 @@ node cloudfront-function/test_handler_logic.js
 
 ## Important limitation
 
-`DirectoryIndex index.html index.htm` always selects the first name without checking whether the object exists. This differs from Apache. See the [full reference](docs/reference.md) before using the project in production.
+Directory index routing is opt-in: add `DirectoryIndex index.html` to `.htaccess` when it is needed. The first configured name is selected without checking whether the object exists, which differs from Apache. See the [full reference](docs/reference.md) before using the project in production.
 
 ## Documentation
 

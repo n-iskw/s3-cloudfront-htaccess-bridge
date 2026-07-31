@@ -100,7 +100,11 @@ function resolveIndexDocument(uri, directoryIndexScopes) {
     return uri;
   }
   var directoryPath = uri.charAt(uri.length - 1) === '/' ? uri : uri + '/';
-  var indexName = firstDirectoryIndexName(directoryPath, directoryIndexScopes || []) || 'index.html';
+  var directoryIndexScope = findDirectoryIndexScope(directoryPath, directoryIndexScopes || []);
+  if (!directoryIndexScope || !directoryIndexScope.names || directoryIndexScope.names.length === 0) {
+    return uri;
+  }
+  var indexName = directoryIndexScope.names[0];
   if (uri === '/') {
     return '/' + indexName;
   }
@@ -110,11 +114,11 @@ function resolveIndexDocument(uri, directoryIndexScopes) {
   return uri + '/' + indexName;
 }
 
-function firstDirectoryIndexName(uri, directoryIndexScopes) {
+function findDirectoryIndexScope(uri, directoryIndexScopes) {
   for (var i = 0; i < directoryIndexScopes.length; i++) {
     var scope = directoryIndexScopes[i];
-    if (uri.substring(0, scope.pathPrefix.length) === scope.pathPrefix && scope.names && scope.names.length > 0) {
-      return scope.names[0];
+    if (uri.substring(0, scope.pathPrefix.length) === scope.pathPrefix) {
+      return scope;
     }
   }
   return null;
@@ -124,19 +128,28 @@ var cases = [
   // [uri, directoryIndexScopes, expectedResolved]
   ['/style.css', [], '/style.css'],
   ['/assets/app.js', [], '/assets/app.js'],
-  ['/about', [], '/about/index.html'],
-  ['/deep/nested', [], '/deep/nested/index.html'],
+  ['/about', [], '/about'],
+  ['/deep/nested', [], '/deep/nested'],
   ['/nonexistent.png', [], '/nonexistent.png'],
-  ['/.well-known/foo', [], '/.well-known/foo/index.html'],
-  ['/foo.', [], '/foo./index.html'],
+  ['/.well-known/foo', [], '/.well-known/foo'],
+  ['/foo.', [], '/foo.'],
   ['/v1.2', [], '/v1.2'],
   ['/file.name.with.dots', [], '/file.name.with.dots'],
   ['/report.v2', [], '/report.v2'],
-  ['/', [], '/index.html'],
+  ['/', [], '/'],
   // DirectoryIndex custom filename cases
   ['/', [{ pathPrefix: '/', names: ['index.php', 'index.html'] }], '/index.php'],
   ['/about/', [{ pathPrefix: '/', names: ['index.php'] }], '/about/index.php'],
   ['/about', [{ pathPrefix: '/', names: ['index.php'] }], '/about/index.php'],
+  ['/about/', [{ pathPrefix: '/', names: [] }], '/about/'],
+  [
+    '/members/',
+    [
+      { pathPrefix: '/members/', names: [] },
+      { pathPrefix: '/', names: ['index.html'] },
+    ],
+    '/members/',
+  ],
   // Most specific scope (longest pathPrefix) wins when scopes overlap.
   [
     '/members/profile',
