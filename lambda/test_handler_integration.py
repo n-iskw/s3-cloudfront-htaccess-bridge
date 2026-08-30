@@ -238,6 +238,38 @@ class PublishToKvsRetryTests(unittest.TestCase):
         self.assertEqual(kvs.describe_calls, 1)
 
 
+class SplitConfigForKvsTests(unittest.TestCase):
+    @staticmethod
+    def _split_with_redirect_chunk_count(chunk_count):
+        with patch.object(
+            hb,
+            "_bin_pack_rules_for_kvs",
+            side_effect=[["[]"] * chunk_count, [], []],
+        ):
+            return hb.split_config_for_kvs(
+                {
+                    "redirects": [],
+                    "authScopes": [],
+                    "directoryIndexScopes": [],
+                    "maintenance": {"enabled": False, "realm": "Maintenance"},
+                }
+            )
+
+    def test_allows_46_chunks_for_exactly_50_update_entries(self):
+        parts = self._split_with_redirect_chunk_count(46)
+
+        # 46 data chunks + 3 directive meta keys + 1 maintenance key.
+        self.assertEqual(len(parts), hb.KVS_UPDATE_MAX_ENTRIES)
+        self.assertEqual(hb.MAX_TOTAL_CHUNKS, 46)
+
+    def test_rejects_47_chunks_before_update_keys_exceeds_50_entries(self):
+        with self.assertRaisesRegex(
+            hb.HtaccessError,
+            "47 KVS chunks required, exceeding the 46-chunk limit per publish",
+        ):
+            self._split_with_redirect_chunk_count(47)
+
+
 class HandlerIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.env_patcher = patch.dict(
@@ -512,11 +544,11 @@ class HandlerIntegrationTests(unittest.TestCase):
         self.assertIn("/section-29/", path_prefixes)
 
     def test_handler_rejects_when_total_chunks_exceed_the_max_chunk_count(self):
-        # Enough redirects to require more chunks than MAX_REDIRECT_CHUNKS
+        # Enough redirects to require more chunks than MAX_TOTAL_CHUNKS
         # allows (a single UpdateKeys call accepts at most 50 key-value
-        # pairs, one of which is reserved for the meta key) must be rejected
-        # cleanly rather than silently dropping rules or raising an
-        # unhandled boto3 error.
+        # pairs, four of which are reserved for three meta keys and the
+        # maintenance key) must be rejected cleanly rather than silently
+        # dropping rules or raising an unhandled boto3 error.
         redirect_count = hb.MAX_TOTAL_CHUNKS * 8 + 50
         many_redirects = "\n".join(f"Redirect 301 /old-{i}/ /new-{i}/" for i in range(redirect_count))
         s3 = FakeS3({".htaccess": many_redirects})
@@ -533,7 +565,7 @@ class HandlerIntegrationTests(unittest.TestCase):
         history_key = result["results"][0]["historyKey"]
         rejected_payload = json.loads(s3.objects[history_key])
         self.assertIn("too many rules across redirects/auth-scopes/directory-index", rejected_payload["error"])
-        self.assertIn("47-chunk limit", rejected_payload["error"])
+        self.assertIn("46-chunk limit", rejected_payload["error"])
 
     def test_handler_finds_htaccess_files_across_multiple_s3_list_pages(self):
         # Real S3's ListObjectsV2 caps each call at 1000 keys and requires
