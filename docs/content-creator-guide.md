@@ -13,6 +13,21 @@
 
 リダイレクトやメンテナンスモードを変更する場合は、対象ディレクトリに `.htaccess` をアップロードします。
 
+### コンテンツのCache-Control
+
+通常コンテンツを新しくアップロードし、アップロード時に`Cache-Control`を指定していない場合、システムが管理者設定の既定値（初期値は`public, max-age=60`）を非同期で追加します。アップロードツールから明示した`Cache-Control`はそのまま保持されます。S3内のCopy／renameで配置するツールは自動付与の対象外なので、copy時に`Cache-Control`を指定してください。
+
+付与結果はS3 Consoleのmetadata表示、または次のコマンドで確認できます。
+
+```bash
+aws s3api head-object \
+  --bucket YOUR-CONTENT-BUCKET \
+  --key path/to/file.html \
+  --query CacheControl
+```
+
+この処理はS3通知を受けてから実行されるため、アップロード直後はmetadata更新前の場合があります。また、`max-age=60`はキャッシュ鮮度を指定する値であり、アップロードから厳密に60秒後の切り替えを保証するものではありません。表示確認までの時間にはCloudFront側の設定や更新前から残っているキャッシュも影響します。
+
 ### メンテナンスモード
 
 Basic 認証を有効にする例:
@@ -131,6 +146,21 @@ members/.htaccess
 Upload site content to S3 with your usual S3 upload method. The client is not fixed. You can use AWS Console, AWS CLI, Cyberduck, a CMS export tool, or another upload tool.
 
 To change redirects or maintenance mode, upload a `.htaccess` file to the target directory.
+
+### Content Cache-Control
+
+When ordinary content is newly uploaded without `Cache-Control`, the system asynchronously adds the administrator-configured default (`public, max-age=60` initially). A value supplied by the upload tool is preserved. Tools that publish through an S3 Copy/rename are outside automatic normalization and must set `Cache-Control` on the copy request.
+
+Check the result in the S3 Console metadata view or with:
+
+```bash
+aws s3api head-object \
+  --bucket YOUR-CONTENT-BUCKET \
+  --key path/to/file.html \
+  --query CacheControl
+```
+
+The metadata update runs after an S3 notification, so it might not be complete immediately after upload. `max-age=60` controls freshness; it does not guarantee a changeover exactly 60 seconds after upload. CloudFront configuration and a response cached before the metadata update also affect when new content is observed.
 
 ### Maintenance Mode
 

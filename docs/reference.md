@@ -17,7 +17,7 @@ S3 + CloudFront static sites do not evaluate Apache `.htaccess` files. This proj
 
 ### 概要
 
-このリファレンス実装は、S3にアップロードされた `.htaccess` と `.htpasswd` をLambdaで検証・変換し、CloudFront KeyValueStoreに反映します。CloudFront Functionsのviewer-request関数は、KVSの設定を使って以下を処理します。
+このリファレンス実装は、S3にアップロードされた `.htaccess` と `.htpasswd` をLambdaで検証・変換し、CloudFront KeyValueStoreに反映します。同じLambdaは、通常コンテンツに`Cache-Control`が指定されていない場合、設定済みの既定値をS3 object metadataへ非同期で追加します。CloudFront Functionsのviewer-request関数は、KVSの設定を使って以下を処理します。
 
 ```text
 hidden file block
@@ -41,29 +41,23 @@ SPA（Single Page Application）のクライアントサイドルーティング
 ```text
 S3 upload client
   |
-  | upload / update / delete .htaccess or .htpasswd
+  | upload content or update/delete .htaccess/.htpasswd
   v
 S3 Event Notification
   |
   v
 Lambda
-  |
-  | reload and validate the site configuration
-  v
-CloudFront KeyValueStore
-  |
-  v
-CloudFront Functions
-  |
-  v
-S3 origin
+  |-- .htaccess/.htpasswd -> validate -> CloudFront KeyValueStore
+  '-- ordinary content without Cache-Control -> same-key metadata copy
+
+viewer request -> CloudFront Functions (reads KeyValueStore) -> S3 origin
 ```
 
-CloudFront FunctionsはリクエストごとにS3の設定ファイルを読みません。`.htaccess` または `.htpasswd` の更新時にLambdaがサイト設定を読み直し、1つの正規化済み設定としてKVSにpublishします。
+CloudFront FunctionsはリクエストごとにS3の設定ファイルを読みません。`.htaccess` または `.htpasswd` の更新時にLambdaがサイト設定を読み直し、1つの正規化済み設定としてKVSにpublishします。通常コンテンツのPut／Post／multipart upload完了時は、既存の`Cache-Control`を保持し、未指定の場合だけ同じkeyへの`CopyObject`で既定値を付けます。
 
 ### ファイル
 
-- `lambda/htaccess_bridge.py`: S3 Event Lambdaと `.htaccess`／`.htpasswd` パーサー
+- `lambda/htaccess_bridge.py`: S3 Event Lambda、コンテンツmetadata更新処理、`.htaccess`／`.htpasswd` パーサー
 - `lambda/test_htaccess_bridge.py`: パーサーとバリデータのテスト
 - `cloudfront-function/handler.js`: CloudFront Functions JavaScript runtime 2.0 サンプル
 - `examples/.htaccess`: サポート対象構文のサンプル
@@ -95,7 +89,7 @@ Lambda ZIP のビルド:
 1. `lambda/htaccess_bridge.py` を Lambda 関数としてデプロイします。
 2. CloudFront KeyValueStore を作成し、ARN を `KVS_ARN` に設定します。
 3. Basic 認証を使う場合は、`htpasswd -s` で `.htpasswd` を作成します。
-4. S3 Event Notificationで `.htaccess` と `.htpasswd` の作成・更新・削除イベントをLambdaに送ります。
+4. S3 Event Notificationで通常コンテンツのPut／Post／multipart upload完了と、`.htaccess`／`.htpasswd` のCopy／削除イベントをLambdaに送ります。
 5. 既存の index document routing 用 CloudFront Functions 関数コードに `cloudfront-function/handler.js` の処理順序を統合します。
 6. 任意のS3アップロードクライアントで `examples/.htpasswd` と `examples/.htaccess` をS3バケットにアップロードします。
 7. `_control-history/published/` に published JSON が作成されることを確認します。
@@ -228,6 +222,7 @@ SPA を S3 + CloudFront でホストする場合は、`CustomErrorResponses` を
 - `KVS_ARN`: CloudFront KeyValueStore ARN。未指定の場合、Lambda は検証と履歴保存だけを行います。
 - `KVS_CONFIG_KEY`: KVS に保存する設定 key。既定値は `htaccess-config`。
 - `ALLOWED_EXTERNAL_HOSTS`: 外部 redirect 先として許可する host のカンマ区切り allowlist。
+- `DEFAULT_CACHE_CONTROL`: 未指定の通常コンテンツに付与する`Cache-Control`。既定値は`public, max-age=60`。
 
 ### Lambda 権限
 
@@ -244,7 +239,14 @@ Lambda execution role には概ね以下の権限が必要です。
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectLegalHold",
+        "s3:GetObjectRetention",
+        "s3:GetObjectVersion",
+        "s3:PutObject",
+        "s3:PutObjectTagging"
+      ],
       "Resource": [
         "arn:aws:s3:::YOUR_BUCKET/*"
       ]
@@ -260,20 +262,25 @@ Lambda execution role には概ね以下の権限が必要です。
 
 ### S3 Event
 
-S3 Event Notificationで、suffix `.htaccess` と `.htpasswd` の `ObjectCreated` と `ObjectRemoved` をLambdaに送ります。通常コンテンツすべてでLambdaを起動しないでください。
+S3 Event Notificationで、通常コンテンツのPut／Post／multipart upload完了と、suffix `.htaccess`／`.htpasswd` のCopy／削除をLambdaに送ります。直接通知のLambdaはS3バケットと同じAWSリージョンに配置する必要があります。
 
 推奨イベント:
 
 ```text
-s3:ObjectCreated:Put
-s3:ObjectCreated:Post
-s3:ObjectCreated:Copy
-s3:ObjectCreated:CompleteMultipartUpload
-s3:ObjectRemoved:Delete
-s3:ObjectRemoved:DeleteMarkerCreated
+全key       -> s3:ObjectCreated:Put / Post / CompleteMultipartUpload
+.htaccess  -> s3:ObjectCreated:Copy / s3:ObjectRemoved:*
+.htpasswd  -> s3:ObjectCreated:Copy / s3:ObjectRemoved:*
 ```
 
+全key側に`ObjectCreated:Copy`を含めないことで、metadata更新の同一key copyによる再起動loopを防ぎます。通常コンテンツをCopyで配置する仕組みは自動付与の対象外なので、copy requestに`Cache-Control`を指定してください。metadata更新自身は実際の`ObjectCreated:Copy` eventを発生させるため、別のS3通知、EventBridge、replication、監査処理では許容または除外が必要です。全keyとsuffixの`ObjectCreated:*`通知を併用すると条件が重複し、S3に拒否されます。既存通知との重複も含め、[組み込みガイド](integration-guide.md)の検査付き手順を使ってください。
+
 `.htaccess` または `.htpasswd` が更新されるたびに、Lambdaはサイト設定を読み直してKVSにpublishします。最後の `.htaccess` が削除された場合は空設定をpublishします。Basic認証が有効なのに対応する `.htpasswd` がない場合はrejectedとなり、直前の有効設定を維持します。
+
+通常コンテンツでは、明示済みの`Cache-Control`を保持し、未指定の場合だけ`DEFAULT_CACHE_CONTROL`を付けます。処理は非同期で、既定値`public, max-age=60`は厳密な60秒後の切り替えを保証しません。managed cache policy `CachingOptimized`のminimum／default／maximum TTLは1／86,400／31,536,000秒で、origin headerがない場合だけdefaultが使われます。`max-age=60`はその範囲内なので60秒が選ばれますが、明示した`no-cache`／`no-store`／`private`もminimum TTLにより最低1秒はCloudFrontにcacheされます。metadata更新前に保存済みのresponseは従来のTTLを維持するため、初回導入時は満了待ちまたは対象keyの一度限りのinvalidationが必要になる場合があります。
+
+単一`CopyObject`のAPI上限は5 GiBで、Lambda timeoutは30秒のため、上限以下の大容量objectも完了を保証しません。copyはACLを`private`へリセットするためBucket owner enforced + OAC／OAIを前提とし、legacy ACL公開は対象外です。SSE-KMS customer managed keyではLambda roleへ`kms:Decrypt`と`kms:GenerateDataKey`等を別途許可してください。S3 Object Lockのretention／legal holdがHEADで確認できるオブジェクトはskipします。SSE-Cはcustomer-provided keyをcopy requestへ渡せないため対象外です。Object Annotationsはchecksumとは別機能であり、`AnnotationDirective=EXCLUDE`により保持しません。checksumはS3の通常のCopyObject動作で保持されます。バージョニング有効バケットでは完全な新規versionが追加されるため、非現行versionのストレージ料金とLifecycleを考慮してください。バージョニング停止中は現在のnull versionを置換し、version IDによる競合防止がないためETag条件によるbest-effort動作です。
+
+Lambdaはeventのversion／ETagと最新HEADを照合し、copyにもETag条件を付けます。検出できたstale eventとHTTP 412は処理済みとして終了し、HTTP 409はLambdaの非同期retryへ渡します。ただしETagはmetadataを表さないため、同一内容でmetadataだけが異なる並行アップロードとの競合を完全には検出できません。同じkeyの並行更新は避けてください。
 
 #### 履歴
 
@@ -313,7 +320,7 @@ S3バージョニングが有効な場合、この例の現行オブジェクト
 
 ### Overview
 
-This reference implementation validates and converts `.htaccess` and `.htpasswd` files uploaded to S3, then publishes normalized rules to CloudFront KeyValueStore. A viewer-request function in CloudFront Functions uses that KVS config to handle:
+This reference implementation validates and converts `.htaccess` and `.htpasswd` files uploaded to S3, then publishes normalized rules to CloudFront KeyValueStore. The same Lambda asynchronously adds the configured default to S3 object metadata when ordinary content has no `Cache-Control`. A viewer-request function in CloudFront Functions uses that KVS config to handle:
 
 ```text
 hidden file block
@@ -337,25 +344,19 @@ SPA (Single Page Application) client-side routing fallback (rewriting every non-
 ```text
 S3 upload client
   |
-  | upload / update / delete .htaccess or .htpasswd
+  | upload content or update/delete .htaccess/.htpasswd
   v
 S3 Event Notification
   |
   v
 Lambda
-  |
-  | reload and validate the site configuration
-  v
-CloudFront KeyValueStore
-  |
-  v
-CloudFront Functions
-  |
-  v
-S3 origin
+  |-- .htaccess/.htpasswd -> validate -> CloudFront KeyValueStore
+  '-- ordinary content without Cache-Control -> same-key metadata copy
+
+viewer request -> CloudFront Functions (reads KeyValueStore) -> S3 origin
 ```
 
-CloudFront Functions does not read configuration files from S3 on each request. When either `.htaccess` or `.htpasswd` changes, Lambda reloads the site configuration and publishes one normalized config to KVS.
+CloudFront Functions does not read configuration files from S3 on each request. When either `.htaccess` or `.htpasswd` changes, Lambda reloads the site configuration and publishes one normalized config to KVS. For ordinary content Put, Post, and completed multipart uploads, it preserves an existing `Cache-Control` value and adds the default only when the value is absent by using `CopyObject` to the same key.
 
 ### Quick Start
 
@@ -379,7 +380,7 @@ Steps for building from scratch:
 1. Deploy `lambda/htaccess_bridge.py` as a Lambda function.
 2. Create a CloudFront KeyValueStore and set its ARN as `KVS_ARN`.
 3. For Basic auth, create `.htpasswd` with `htpasswd -s`.
-4. Configure S3 Event Notification for `.htaccess` and `.htpasswd` create/update/delete events.
+4. Configure S3 Event Notification for ordinary content Put/Post/completed multipart uploads and `.htaccess`/`.htpasswd` Copy/removal events.
 5. Merge `cloudfront-function/handler.js` into the existing viewer-request CloudFront Functions code that performs index document routing.
 6. Upload `examples/.htpasswd` and `examples/.htaccess` to the S3 bucket with any S3 upload client.
 7. Confirm that Lambda writes a published JSON under `_control-history/published/`.
@@ -512,6 +513,7 @@ If you need to host a SPA on S3 + CloudFront, consider a separate CloudFront dis
 - `KVS_ARN`: CloudFront KeyValueStore ARN. If omitted, Lambda only validates and writes history.
 - `KVS_CONFIG_KEY`: KVS key for published config. Default: `htaccess-config`.
 - `ALLOWED_EXTERNAL_HOSTS`: comma-separated allowlist for external redirect targets.
+- `DEFAULT_CACHE_CONTROL`: `Cache-Control` added to ordinary content when absent. Default: `public, max-age=60`.
 
 ### Lambda Permissions
 
@@ -528,7 +530,14 @@ The Lambda execution role needs permissions equivalent to:
     },
     {
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Action": [
+        "s3:GetObject",
+        "s3:GetObjectLegalHold",
+        "s3:GetObjectRetention",
+        "s3:GetObjectVersion",
+        "s3:PutObject",
+        "s3:PutObjectTagging"
+      ],
       "Resource": [
         "arn:aws:s3:::YOUR_BUCKET/*"
       ]
@@ -544,20 +553,25 @@ The Lambda execution role needs permissions equivalent to:
 
 ### S3 Event
 
-Configure S3 Event Notification for `ObjectCreated` and `ObjectRemoved` with suffixes `.htaccess` and `.htpasswd`. Do not trigger this Lambda for every content upload.
+Configure S3 Event Notification for ordinary content Put/Post/completed multipart uploads, plus Copy/removal events with `.htaccess` and `.htpasswd` suffixes. A directly notified Lambda function must be in the same AWS Region as the S3 bucket.
 
 Recommended events:
 
 ```text
-s3:ObjectCreated:Put
-s3:ObjectCreated:Post
-s3:ObjectCreated:Copy
-s3:ObjectCreated:CompleteMultipartUpload
-s3:ObjectRemoved:Delete
-s3:ObjectRemoved:DeleteMarkerCreated
+all keys   -> s3:ObjectCreated:Put / Post / CompleteMultipartUpload
+.htaccess  -> s3:ObjectCreated:Copy / s3:ObjectRemoved:*
+.htpasswd  -> s3:ObjectCreated:Copy / s3:ObjectRemoved:*
 ```
 
+Excluding `ObjectCreated:Copy` from the all-key rule prevents the same-key metadata copy from invoking Lambda in a loop. A deployment that copies ordinary content must supply `Cache-Control` in its copy request. The metadata update itself still emits a real `ObjectCreated:Copy` event, so other S3 notifications, EventBridge rules, replication, and audit consumers must tolerate or exclude it. Do not combine all-key and suffix `ObjectCreated:*` notifications because S3 rejects overlapping rules. Use the overlap-checking procedure in the [integration guide](integration-guide.md), including for existing notifications.
+
 When either `.htaccess` or `.htpasswd` changes, Lambda reloads the site configuration and publishes it to KVS. Deleting the last `.htaccess` publishes an empty config. If Basic auth is enabled without a matching `.htpasswd`, the update is rejected and the last valid config remains active.
+
+For ordinary content, Lambda preserves an explicit `Cache-Control` value and adds `DEFAULT_CACHE_CONTROL` only when absent. Processing is asynchronous, and the default `public, max-age=60` does not promise a changeover exactly 60 seconds later. The `CachingOptimized` managed policy has minimum/default/maximum TTL values of 1/86,400/31,536,000 seconds; its default is used only when the origin sends no cache header. `max-age=60` is within the bounds, while explicit `no-cache`, `no-store`, or `private` values are still cached by CloudFront for the one-second minimum. A response cached before the metadata update keeps its prior TTL, so initial rollout can require waiting for expiry or a one-time invalidation of affected keys.
+
+A single `CopyObject` has a 5 GiB API limit, and the Lambda timeout is 30 seconds, so completion is not guaranteed for large objects below that limit either. Copy resets the ACL to `private`, so Bucket owner enforced with OAC/OAI is assumed and legacy ACL-based publication is unsupported. SSE-KMS customer managed keys require separate `kms:Decrypt`, `kms:GenerateDataKey`, and applicable key-policy grants for Lambda. Objects whose Object Lock retention/legal-hold settings are visible in HEAD are skipped. SSE-C is unsupported because its customer-provided key cannot be supplied by this copy request. Object Annotations are distinct from checksums and are not preserved because the request uses `AnnotationDirective=EXCLUDE`; checksums are preserved by normal S3 CopyObject behavior. In a versioned bucket, this creates another full object version, so account for noncurrent-version storage and Lifecycle. With Versioning suspended, the current null version is replaced and concurrency protection is best-effort through ETag conditions because no version-ID guard is available.
+
+Lambda compares the event version/ETag with the latest HEAD and conditions the copy on the ETag. Detectably stale events and HTTP 412 responses finish successfully; HTTP 409 responses are raised for Lambda's asynchronous retry. Because an ETag does not represent metadata, this cannot always detect a concurrent upload with identical content but different metadata. Avoid concurrent writes to the same key.
 
 #### History
 

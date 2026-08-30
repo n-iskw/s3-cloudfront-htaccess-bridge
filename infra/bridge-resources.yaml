@@ -1,8 +1,10 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Description: >
   Bridge resources for an existing S3 + CloudFront site. Creates Lambda,
-  KeyValueStore, and a function in CloudFront Functions without modifying
-  the existing bucket notification configuration or Distribution.
+  KeyValueStore, and a function in CloudFront Functions. The Lambda publishes
+  htaccess configuration and applies a default Cache-Control value to newly
+  uploaded content. The template does not modify the existing bucket
+  notification configuration or Distribution.
 
 Parameters:
   ProjectName:
@@ -11,6 +13,17 @@ Parameters:
   ContentBucketName:
     Type: String
     Description: "Name of your EXISTING site content bucket (not created by this template)."
+  DefaultCacheControl:
+    Type: String
+    Default: "public, max-age=60"
+    MinLength: 1
+    MaxLength: 512
+    AllowedPattern: '^[ -~]+$'
+    ConstraintDescription: "must contain printable ASCII characters only"
+    Description: >
+      Cache-Control value added to newly uploaded public content when the
+      object does not already have Cache-Control metadata.
+
 Resources:
   HtaccessConfigStore:
     Type: AWS::CloudFront::KeyValueStore
@@ -34,7 +47,11 @@ Resources:
             Effect: Allow
             Action:
               - s3:GetObject
+              - s3:GetObjectLegalHold
+              - s3:GetObjectRetention
+              - s3:GetObjectVersion
               - s3:PutObject
+              - s3:PutObjectTagging
             Resource: !Sub "arn:aws:s3:::${ContentBucketName}/*"
           - Sid: CloudFrontKvsAccess
             Effect: Allow
@@ -90,6 +107,7 @@ Resources:
         Variables:
           KVS_ARN: !GetAtt HtaccessConfigStore.Arn
           HISTORY_PREFIX: _control-history
+          DEFAULT_CACHE_CONTROL: !Ref DefaultCacheControl
 
   HtaccessBridgeLogGroup:
     Type: AWS::Logs::LogGroup
