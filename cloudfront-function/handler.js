@@ -26,6 +26,9 @@ async function handler(event) {
 
   var redirect = findRedirect(uri, config.redirects || []);
   if (redirect) {
+    if (!isSafeRedirectLocation(redirect.location)) {
+      return forbidden();
+    }
     return {
       statusCode: redirect.status,
       statusDescription: redirect.status === 301 ? 'Moved Permanently' : 'Found',
@@ -242,8 +245,31 @@ function findRedirect(uri, rules) {
 
 function appendRemainder(uri, from, to) {
   var remainder = uri.substring(from.length);
+  if (startsWith(to, '/') && !startsWith(to, '//')) {
+    var hadLeadingSlash = startsWith(remainder, '/');
+    while (startsWith(remainder, '/')) {
+      remainder = remainder.substring(1);
+    }
+    if (!remainder) {
+      return hadLeadingSlash && !endsWith(to, '/') ? to + '/' : to;
+    }
+    return to + (endsWith(to, '/') ? '' : '/') + remainder;
+  }
   var separator = remainder && !endsWith(to, '/') && !startsWith(remainder, '/') ? '/' : '';
   return to + separator + remainder;
+}
+
+function isSafeRedirectLocation(location) {
+  if (typeof location !== 'string' || !location || startsWith(location, '//')) {
+    return false;
+  }
+  for (var i = 0; i < location.length; i++) {
+    var code = location.charCodeAt(i);
+    if (location.charAt(i) === '\\' || code <= 0x20 || code === 0x7f) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function resolveIndexDocument(uri, directoryIndexScopes) {

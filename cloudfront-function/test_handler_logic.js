@@ -167,6 +167,7 @@ if (unauthorized({ realm: 'Maintenance' }).statusCode !== 401) {
 var hasFileExtension = extractFunction('hasFileExtension', 'uri');
 var resolveIndexDocument = extractFunction('resolveIndexDocument', 'uri, directoryIndexScopes');
 var appendRemainder = extractFunction('appendRemainder', 'uri, from, to');
+var isSafeRedirectLocation = extractFunction('isSafeRedirectLocation', 'location');
 var ipv4ToInt = extractFunction('ipv4ToInt', 'ip');
 
 var appendRemainderCases = [
@@ -174,12 +175,33 @@ var appendRemainderCases = [
   ['/old/path', '/old/', '/new/', '/new/path'],
   ['/old/path', '/old', '/new', '/new/path'],
   ['/old/path', '/old/', '/new', '/new/path'],
-  ['/old/path', '/old', '/new/', '/new//path'],
+  ['/old/path', '/old', '/new/', '/new/path'],
+  ['/old/', '/old', '/new', '/new/'],
+  ['/old//', '/old', '/new', '/new/'],
+  ['/old/evil.example', '/old', '/', '/evil.example'],
+  ['/old//evil.example', '/old', '/', '/evil.example'],
+  ['/old/path', '/old', 'https://allowed.example/base', 'https://allowed.example/base/path'],
 ];
 appendRemainderCases.forEach(function (testCase) {
   var actual = appendRemainder(testCase[0], testCase[1], testCase[2]);
   if (actual !== testCase[3]) {
     throw new Error('unexpected redirect remainder result: ' + actual);
+  }
+});
+
+var redirectLocationCases = [
+  ['/new/path', true],
+  ['https://allowed.example/new', true],
+  [null, false],
+  ['//evil.example', false],
+  ['/\\evil.example', false],
+  ['/bad path', false],
+  ['/bad\tpath', false],
+  ['/bad\x7fpath', false],
+];
+redirectLocationCases.forEach(function (testCase) {
+  if (isSafeRedirectLocation(testCase[0]) !== testCase[1]) {
+    throw new Error('unexpected redirect Location safety result for ' + JSON.stringify(testCase[0]));
   }
 });
 
@@ -327,13 +349,17 @@ function makeHandlerWithStore(store) {
   return context.__handler;
 }
 
-function makeHandlerStore(authScopes, maintenance) {
+function makeHandlerStore(authScopes, maintenance, redirects) {
+  redirects = redirects || [];
   var store = {
-    'htaccess-redirects-meta': JSON.stringify({ chunkCount: 0 }),
+    'htaccess-redirects-meta': JSON.stringify({ chunkCount: redirects.length ? 1 : 0 }),
     'htaccess-auth-scopes-meta': JSON.stringify({ chunkCount: authScopes.length ? 1 : 0 }),
     'htaccess-directory-index-meta': JSON.stringify({ chunkCount: 0 }),
     'htaccess-maintenance': JSON.stringify(maintenance),
   };
+  if (redirects.length) {
+    store['htaccess-redirects-0'] = JSON.stringify(redirects);
+  }
   if (authScopes.length) {
     store['htaccess-auth-scopes-0'] = JSON.stringify(authScopes);
   }
@@ -478,9 +504,64 @@ async function runAsyncTests() {
     failures++;
   }
 
+  var noMaintenance = { enabled: false, realm: 'Maintenance' };
+  var normalizedRedirectHandler = makeHandlerWithStore(makeHandlerStore(
+    [],
+    noMaintenance,
+    [{ type: 'redirect', from: '/old', to: '/', status: 302 }]
+  ));
+  var normalizedRedirect = await normalizedRedirectHandler({
+    request: { uri: '/old/evil.example', headers: {} },
+    viewer: { ip: '198.51.100.20' },
+  });
+  if (normalizedRedirect.statusCode !== 302 ||
+      normalizedRedirect.headers.location.value !== '/evil.example') {
+    console.log('FAIL full handler (normalized internal redirect): got ' + JSON.stringify(normalizedRedirect));
+    failures++;
+  }
+
+  var externalRedirectHandler = makeHandlerWithStore(makeHandlerStore(
+    [],
+    noMaintenance,
+    [{ type: 'redirect', from: '/go', to: 'https://allowed.example/base', status: 302 }]
+  ));
+  var externalRedirect = await externalRedirectHandler({
+    request: { uri: '/go/path', headers: {} },
+    viewer: { ip: '198.51.100.20' },
+  });
+  if (externalRedirect.statusCode !== 302 ||
+      externalRedirect.headers.location.value !== 'https://allowed.example/base/path') {
+    console.log('FAIL full handler (external HTTPS redirect): got ' + JSON.stringify(externalRedirect));
+    failures++;
+  }
+
+  var unsafeRedirects = [
+    { type: 'redirect', from: '/old', to: '//evil.example', status: 302 },
+    { type: 'redirect', from: '/old', to: '/\\evil.example', status: 302 },
+    { type: 'redirect', from: '/old', to: '/bad path', status: 302 },
+    { type: 'rewrite', basePath: '/', pattern: '^old/(.*)$', to: '/$1', status: 302 },
+  ];
+  for (var unsafeIndex = 0; unsafeIndex < unsafeRedirects.length; unsafeIndex++) {
+    var unsafeRule = unsafeRedirects[unsafeIndex];
+    var unsafeRedirectHandler = makeHandlerWithStore(makeHandlerStore(
+      [],
+      noMaintenance,
+      [unsafeRule]
+    ));
+    var unsafeUri = unsafeRule.type === 'rewrite' ? '/old//evil.example' : '/old';
+    var unsafeRedirect = await unsafeRedirectHandler({
+      request: { uri: unsafeUri, headers: {} },
+      viewer: { ip: '198.51.100.20' },
+    });
+    if (unsafeRedirect.statusCode !== 403 || unsafeRedirect.headers.location) {
+      console.log('FAIL full handler (unsafe redirect fail-closed): got ' + JSON.stringify(unsafeRedirect));
+      failures++;
+    }
+  }
+
   var totalCases = hasFileExtensionCases.length + cases.length + blockedPathCases.length +
     scopeCases.length + authScopeCases.length + appendRemainderCases.length +
-    ipv4ToIntCases.length + 10;
+    redirectLocationCases.length + ipv4ToIntCases.length + 16;
   if (failures === 0) {
     console.log('All ' + totalCases + ' cases passed.');
     process.exit(0);
