@@ -276,6 +276,8 @@ S3 Event Notificationで、通常コンテンツのPut／Post／multipart upload
 
 `.htaccess` または `.htpasswd` が更新されるたびに、Lambdaはサイト設定を読み直してKVSにpublishします。最後の `.htaccess` が削除された場合は空設定をpublishします。Basic認証が有効なのに対応する `.htpasswd` がない場合はrejectedとなり、直前の有効設定を維持します。
 
+1回の`UpdateKeys`は最大50エントリです。この実装は3種類のmeta keyとmaintenance keyの計4エントリを予約するため、ルールデータは合計46チャンクまでpublishできます。47チャンク以上が必要な更新はrejectedとなり、直前の有効設定を維持します。
+
 通常コンテンツでは、明示済みの`Cache-Control`を保持し、未指定の場合だけ`DEFAULT_CACHE_CONTROL`を付けます。処理は非同期で、既定値`public, max-age=60`は厳密な60秒後の切り替えを保証しません。managed cache policy `CachingOptimized`のminimum／default／maximum TTLは1／86,400／31,536,000秒で、origin headerがない場合だけdefaultが使われます。`max-age=60`はその範囲内なので60秒が選ばれますが、明示した`no-cache`／`no-store`／`private`もminimum TTLにより最低1秒はCloudFrontにcacheされます。metadata更新前に保存済みのresponseは従来のTTLを維持するため、初回導入時は満了待ちまたは対象keyの一度限りのinvalidationが必要になる場合があります。
 
 単一`CopyObject`のAPI上限は5 GiBで、Lambda timeoutは30秒のため、上限以下の大容量objectも完了を保証しません。copyはACLを`private`へリセットするためBucket owner enforced + OAC／OAIを前提とし、legacy ACL公開は対象外です。SSE-KMS customer managed keyではLambda roleへ`kms:Decrypt`と`kms:GenerateDataKey`等を別途許可してください。S3 Object Lockのretention／legal holdがHEADで確認できるオブジェクトはskipします。SSE-Cはcustomer-provided keyをcopy requestへ渡せないため対象外です。Object Annotationsはchecksumとは別機能であり、`AnnotationDirective=EXCLUDE`により保持しません。checksumはS3の通常のCopyObject動作で保持されます。バージョニング有効バケットでは完全な新規versionが追加されるため、非現行versionのストレージ料金とLifecycleを考慮してください。バージョニング停止中は現在のnull versionを置換し、version IDによる競合防止がないためETag条件によるbest-effort動作です。
@@ -566,6 +568,8 @@ all keys   -> s3:ObjectCreated:Put / Post / CompleteMultipartUpload
 Excluding `ObjectCreated:Copy` from the all-key rule prevents the same-key metadata copy from invoking Lambda in a loop. A deployment that copies ordinary content must supply `Cache-Control` in its copy request. The metadata update itself still emits a real `ObjectCreated:Copy` event, so other S3 notifications, EventBridge rules, replication, and audit consumers must tolerate or exclude it. Do not combine all-key and suffix `ObjectCreated:*` notifications because S3 rejects overlapping rules. Use the overlap-checking procedure in the [integration guide](integration-guide.md), including for existing notifications.
 
 When either `.htaccess` or `.htpasswd` changes, Lambda reloads the site configuration and publishes it to KVS. Deleting the last `.htaccess` publishes an empty config. If Basic auth is enabled without a matching `.htpasswd`, the update is rejected and the last valid config remains active.
+
+One `UpdateKeys` call accepts at most 50 entries. This implementation reserves four entries for the three directive meta keys and the maintenance key, leaving room for 46 rule-data chunks in one publish. An update that requires 47 or more chunks is rejected, and the last valid configuration remains active.
 
 For ordinary content, Lambda preserves an explicit `Cache-Control` value and adds `DEFAULT_CACHE_CONTROL` only when absent. Processing is asynchronous, and the default `public, max-age=60` does not promise a changeover exactly 60 seconds later. The `CachingOptimized` managed policy has minimum/default/maximum TTL values of 1/86,400/31,536,000 seconds; its default is used only when the origin sends no cache header. `max-age=60` is within the bounds, while explicit `no-cache`, `no-store`, or `private` values are still cached by CloudFront for the one-second minimum. A response cached before the metadata update keeps its prior TTL, so initial rollout can require waiting for expiry or a one-time invalidation of affected keys.
 

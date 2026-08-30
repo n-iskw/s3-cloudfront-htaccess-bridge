@@ -633,10 +633,12 @@ CHUNK_TARGET_BYTES = 900
 
 # CloudFront KeyValueStore quota: a single UpdateKeys call accepts at most
 # 50 key-value pairs. Three directive types (redirects, auth scopes,
-# directory index) each reserve one key for their meta key, leaving at most
-# 47 chunk keys total to share across them in a single publish alongside
-# the single-key maintenance value.
-MAX_TOTAL_CHUNKS = 47
+# directory index) each reserve one key for their meta key, and maintenance
+# reserves one more key. That leaves 46 chunk keys to share across all three
+# directive types.
+KVS_UPDATE_MAX_ENTRIES = 50
+KVS_FIXED_ENTRY_COUNT = 4
+MAX_TOTAL_CHUNKS = KVS_UPDATE_MAX_ENTRIES - KVS_FIXED_ENTRY_COUNT
 
 
 def _bin_pack_rules_for_kvs(rules: List[Dict[str, Any]]) -> List[str]:
@@ -698,7 +700,7 @@ def split_config_for_kvs(config: Dict[str, Any]) -> Dict[str, str]:
             parts[f"{chunk_prefix}{index}"] = chunk_value
         parts[meta_key] = _json_dumps({"chunkCount": len(chunk_values)})
 
-    if total_chunks > MAX_TOTAL_CHUNKS:
+    if len(parts) > KVS_UPDATE_MAX_ENTRIES:
         raise HtaccessError(
             f"too many rules across redirects/auth-scopes/directory-index: {total_chunks} KVS chunks "
             f"required, exceeding the {MAX_TOTAL_CHUNKS}-chunk limit per publish"
