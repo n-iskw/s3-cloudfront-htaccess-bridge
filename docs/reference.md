@@ -219,7 +219,7 @@ SPA を S3 + CloudFront でホストする場合は、`CustomErrorResponses` を
 - `RULES_KEY`: 監視対象の厳密な S3 key。未指定の場合、バケット内の全 `.htaccess` を対象にします。
 - `RULES_SUFFIX`: `RULES_KEY` 未指定時に対象とする suffix。既定値は `.htaccess`。
 - `HISTORY_PREFIX`: 履歴保存 prefix。既定値は `_control-history`。
-- `KVS_ARN`: CloudFront KeyValueStore ARN。未指定の場合、Lambda は検証と履歴保存だけを行います。
+- `KVS_ARN`: CloudFront KeyValueStore ARN。未指定の場合、サイト設定をKVSへpublishしません。通常コンテンツへの`Cache-Control`付与は引き続き実行します。
 - `KVS_CONFIG_KEY`: KVS に保存する設定 key。既定値は `htaccess-config`。
 - `ALLOWED_EXTERNAL_HOSTS`: 外部 redirect 先として許可する host のカンマ区切り allowlist。
 - `DEFAULT_CACHE_CONTROL`: 未指定の通常コンテンツに付与する`Cache-Control`。既定値は`public, max-age=60`。
@@ -510,7 +510,7 @@ If you need to host a SPA on S3 + CloudFront, consider a separate CloudFront dis
 - `RULES_KEY`: Optional exact S3 key to watch. If omitted, every `.htaccess` in the bucket is considered.
 - `RULES_SUFFIX`: S3 key suffix to watch when `RULES_KEY` is omitted. Default: `.htaccess`.
 - `HISTORY_PREFIX`: History prefix. Default: `_control-history`.
-- `KVS_ARN`: CloudFront KeyValueStore ARN. If omitted, Lambda only validates and writes history.
+- `KVS_ARN`: CloudFront KeyValueStore ARN. If omitted, site configuration is not published to KVS; automatic `Cache-Control` processing for ordinary content still runs.
 - `KVS_CONFIG_KEY`: KVS key for published config. Default: `htaccess-config`.
 - `ALLOWED_EXTERNAL_HOSTS`: comma-separated allowlist for external redirect targets.
 - `DEFAULT_CACHE_CONTROL`: `Cache-Control` added to ordinary content when absent. Default: `public, max-age=60`.
