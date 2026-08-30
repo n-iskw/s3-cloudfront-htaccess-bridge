@@ -541,6 +541,8 @@ def _validate_source_path(path: str, line_no: int) -> None:
 
 
 def _validate_target(target: str, allowed_hosts: set, line_no: int) -> None:
+    if _has_unsafe_redirect_characters(target):
+        raise HtaccessError(f"line {line_no}: redirect target must be an internal path or http(s) URL")
     if _is_internal_path(target):
         return
     parsed = urllib.parse.urlparse(target)
@@ -721,7 +723,17 @@ def _expect_arg_count(line: ParsedLine, count: int) -> None:
 
 
 def _is_internal_path(target: str) -> bool:
-    return target.startswith("/") and not target.startswith("//")
+    return (
+        target.startswith("/")
+        and not target.startswith("//")
+        and not _has_unsafe_redirect_characters(target)
+    )
+
+
+def _has_unsafe_redirect_characters(target: str) -> bool:
+    return "\\" in target or any(
+        ord(char) <= 0x20 or ord(char) == 0x7F for char in target
+    )
 
 
 def _would_loop(source: str, target: str) -> bool:

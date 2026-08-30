@@ -155,6 +155,19 @@ class HtaccessBridgeTests(unittest.TestCase):
 
         self.assertEqual(config["redirects"][0]["to"], "https://example.com/new/")
 
+    def test_rejects_unsafe_internal_redirect_targets(self):
+        for target in ["/\\evil.example", "/bad path", "/bad\tpath", "/bad\x7fpath"]:
+            with self.subTest(target=repr(target)):
+                with self.assertRaisesRegex(HtaccessError, "must be an internal path"):
+                    parse_htaccess(f'Redirect 302 /old/ "{target}"')
+
+    def test_rejects_external_redirect_backslash_allowlist_bypass(self):
+        with self.assertRaisesRegex(HtaccessError, "must be an internal path"):
+            parse_htaccess(
+                'Redirect 302 /old/ "https://evil.example\\@allowed.example/path"',
+                allowed_external_hosts=["allowed.example"],
+            )
+
     def test_rejects_obvious_loop(self):
         with self.assertRaisesRegex(HtaccessError, "loop"):
             parse_htaccess("Redirect 301 /old/ /old/new/")
