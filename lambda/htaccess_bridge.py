@@ -14,6 +14,16 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 KVS_PUBLISH_MAX_ATTEMPTS = 5
 KVS_PUBLISH_BASE_DELAY_SECONDS = 0.2
 
+DEFAULT_CACHE_CONTROL = "public, max-age=60"
+CONTENT_OBJECT_CREATED_EVENTS = frozenset(
+    {
+        "ObjectCreated:Put",
+        "ObjectCreated:Post",
+        "ObjectCreated:CompleteMultipartUpload",
+    }
+)
+S3_COPY_OBJECT_MAX_BYTES = 5 * 1024**3
+
 
 SUPPORTED_DIRECTIVES = {
     "authtype",
@@ -297,12 +307,39 @@ def handler(event: Dict[str, Any], context: Any) -> Dict[str, Any]:
     rules_suffix = os.environ.get("RULES_SUFFIX", ".htaccess")
     history_prefix = os.environ.get("HISTORY_PREFIX", "_control-history").strip("/")
     allowed_hosts = _split_csv(os.environ.get("ALLOWED_EXTERNAL_HOSTS", ""))
+    default_cache_control = os.environ.get(
+        "DEFAULT_CACHE_CONTROL", DEFAULT_CACHE_CONTROL
+    ).strip()
 
     results = []
     for record in event.get("Records", []):
         bucket = record["s3"]["bucket"]["name"]
         key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
-        if not (_is_rules_key(key, rules_key, rules_suffix) or key == ".htpasswd" or key.endswith("/.htpasswd")):
+        is_config_key = (
+            _is_rules_key(key, rules_key, rules_suffix)
+            or key == ".htpasswd"
+            or key.endswith("/.htpasswd")
+        )
+        if not is_config_key and _is_cache_control_candidate(
+            record,
+            key,
+            history_prefix=history_prefix,
+        ):
+            result = _apply_default_cache_control(
+                s3,
+                bucket,
+                key,
+                record,
+                default_cache_control=default_cache_control,
+            )
+            details = result.get("details", {})
+            _log_event(result["status"], bucket=bucket, key=key, **details)
+            results.append(
+                {"bucket": bucket, "key": key, "status": result["status"], **details}
+            )
+            continue
+
+        if not is_config_key:
             _log_event("skipped", bucket=bucket, key=key)
             results.append({"bucket": bucket, "key": key, "status": "skipped"})
             continue
@@ -829,6 +866,215 @@ def _is_rules_key(key: str, exact_key: Optional[str], suffix: str) -> bool:
     if exact_key:
         return key == exact_key
     return key == suffix or key.endswith("/" + suffix)
+
+
+def _is_cache_control_candidate(
+    record: Dict[str, Any],
+    key: str,
+    *,
+    history_prefix: str,
+) -> bool:
+    """Return whether an S3 event represents a public-content upload.
+
+    ObjectCreated:Copy is deliberately excluded. Adding Cache-Control requires
+    a same-key copy, and processing the resulting Copy event would recurse.
+    Control files are also excluded even when RULES_KEY points somewhere else.
+    """
+    if record.get("eventName") not in CONTENT_OBJECT_CREATED_EVENTS:
+        return False
+    if key == ".htaccess" or key.endswith("/.htaccess"):
+        return False
+    if key == ".htpasswd" or key.endswith("/.htpasswd"):
+        return False
+    if history_prefix and (key == history_prefix or key.startswith(history_prefix + "/")):
+        return False
+    return True
+
+
+def _apply_default_cache_control(
+    s3: Any,
+    bucket: str,
+    key: str,
+    record: Dict[str, Any],
+    *,
+    default_cache_control: str,
+) -> Dict[str, Any]:
+    """Add Cache-Control through a conditional same-key S3 copy.
+
+    S3 has no metadata-only update operation. The current object is therefore
+    copied onto the same key with MetadataDirective=REPLACE. Both the source
+    and destination are conditioned on the ETag returned by HEAD, so a newer
+    upload with different content/ETag that wins the race is not overwritten.
+    On versioned buckets the event's version must also still be the current
+    version before it is used as the copy source. ETags do not identify
+    metadata-only changes, so identical-byte races remain an operational
+    limitation.
+    """
+    object_info = record.get("s3", {}).get("object", {})
+    event_etag = _normalize_etag(object_info.get("eTag"))
+    event_version_id = object_info.get("versionId")
+    if not default_cache_control:
+        raise ValueError("DEFAULT_CACHE_CONTROL must not be empty")
+    if not event_etag:
+        return {
+            "status": "cache-control-skipped",
+            "details": {"reason": "event-etag-missing"},
+        }
+
+    try:
+        # This must be an unversioned HEAD: it establishes what is current now,
+        # rather than merely proving that an older event version still exists.
+        current = s3.head_object(Bucket=bucket, Key=key)
+    except Exception as exc:  # noqa: BLE001 - boto3 service exceptions are generated dynamically
+        if _is_stale_s3_object_exception(exc):
+            return {
+                "status": "cache-control-stale",
+                "details": {"reason": _s3_error_code(exc) or "object-not-current"},
+            }
+        raise
+
+    current_etag = current.get("ETag")
+    normalized_current_etag = _normalize_etag(current_etag)
+    current_version_id = current.get("VersionId")
+    if not current_etag or not normalized_current_etag:
+        return {
+            "status": "cache-control-stale",
+            "details": {"reason": "current-etag-missing"},
+        }
+    if event_etag and event_etag != normalized_current_etag:
+        return {
+            "status": "cache-control-stale",
+            "details": {"reason": "etag-mismatch"},
+        }
+    if event_version_id is not None and str(event_version_id) != str(current_version_id):
+        return {
+            "status": "cache-control-stale",
+            "details": {"reason": "version-mismatch"},
+        }
+
+    if current.get("CacheControl") is not None:
+        return {
+            "status": "cache-control-preserved",
+            "details": {"cacheControl": current["CacheControl"]},
+        }
+
+    object_lock_fields = (
+        "ObjectLockMode",
+        "ObjectLockRetainUntilDate",
+        "ObjectLockLegalHoldStatus",
+    )
+    present_object_lock_fields = [
+        field for field in object_lock_fields if current.get(field) is not None
+    ]
+    if present_object_lock_fields:
+        return {
+            "status": "cache-control-skipped",
+            "details": {
+                "reason": "object-lock-unsupported",
+                "objectLockFields": present_object_lock_fields,
+            },
+        }
+
+    object_size = int(current.get("ContentLength", 0))
+    if object_size > S3_COPY_OBJECT_MAX_BYTES:
+        return {
+            "status": "cache-control-skipped",
+            "details": {
+                "reason": "object-exceeds-copy-object-limit",
+                "objectSize": object_size,
+                "maxObjectSize": S3_COPY_OBJECT_MAX_BYTES,
+            },
+        }
+
+    copy_source: Dict[str, Any] = {"Bucket": bucket, "Key": key}
+    source_version_id = event_version_id if event_version_id is not None else current_version_id
+    if source_version_id is not None:
+        copy_source["VersionId"] = str(source_version_id)
+
+    copy_args: Dict[str, Any] = {
+        "Bucket": bucket,
+        "Key": key,
+        "CopySource": copy_source,
+        "CopySourceIfMatch": current_etag,
+        # Destination-side conditional writes close the race between HEAD and
+        # CopyObject when the newer upload has a different ETag. Without this,
+        # such a newer upload could be replaced by the version observed above.
+        "IfMatch": current_etag,
+        "MetadataDirective": "REPLACE",
+        "TaggingDirective": "COPY",
+        # S3 Object Annotations are outside this feature's metadata contract.
+        # Excluding them also avoids requiring annotation-specific IAM actions.
+        "AnnotationDirective": "EXCLUDE",
+        "Metadata": dict(current.get("Metadata") or {}),
+        "CacheControl": default_cache_control,
+    }
+    for field in (
+        "ContentType",
+        "ContentEncoding",
+        "ContentDisposition",
+        "ContentLanguage",
+        "Expires",
+        "WebsiteRedirectLocation",
+        "StorageClass",
+        "ServerSideEncryption",
+        "SSEKMSKeyId",
+        "BucketKeyEnabled",
+    ):
+        if field in current and current[field] is not None:
+            copy_args[field] = current[field]
+
+    try:
+        s3.copy_object(**copy_args)
+    except Exception as exc:  # noqa: BLE001 - boto3 service exceptions are generated dynamically
+        if _is_stale_s3_object_exception(exc):
+            return {
+                "status": "cache-control-stale",
+                "details": {"reason": _s3_error_code(exc) or "conditional-copy-conflict"},
+            }
+        raise
+
+    return {
+        "status": "cache-control-updated",
+        "details": {"cacheControl": default_cache_control},
+    }
+
+
+def _normalize_etag(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if len(normalized) >= 2 and normalized[0] == '"' and normalized[-1] == '"':
+        normalized = normalized[1:-1]
+    return normalized or None
+
+
+def _s3_error_code(exc: Exception) -> Optional[str]:
+    response = getattr(exc, "response", None)
+    if not isinstance(response, dict):
+        return None
+    error = response.get("Error", {})
+    code = error.get("Code") if isinstance(error, dict) else None
+    return str(code) if code is not None else None
+
+
+def _is_stale_s3_object_exception(exc: Exception) -> bool:
+    response = getattr(exc, "response", None)
+    status_code = None
+    if isinstance(response, dict):
+        metadata = response.get("ResponseMetadata", {})
+        if isinstance(metadata, dict):
+            status_code = metadata.get("HTTPStatusCode")
+    code = _s3_error_code(exc)
+    # 409 ConditionalRequestConflict is retryable. Do not turn it into a
+    # successful stale result: the same current object can still be missing
+    # Cache-Control, and the asynchronous Lambda invocation must be retried.
+    return status_code in {404, 412} or code in {
+        "404",
+        "412",
+        "NoSuchKey",
+        "NoSuchVersion",
+        "PreconditionFailed",
+    }
 
 
 def _load_all_htaccess_files(s3: Any, bucket: str, exact_key: Optional[str], suffix: str) -> List[Tuple[str, str]]:

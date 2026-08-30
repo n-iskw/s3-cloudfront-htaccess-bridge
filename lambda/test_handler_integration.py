@@ -6,6 +6,7 @@ control flow against in-memory fake clients.
 """
 
 import contextlib
+import datetime as dt
 import io
 import json
 import unittest
@@ -39,7 +40,15 @@ FakeConflictOnce.__name__ = "ConflictException"
 
 
 class FakeS3:
-    def __init__(self, objects=None, page_size=None):
+    def __init__(
+        self,
+        objects=None,
+        page_size=None,
+        *,
+        object_heads=None,
+        head_error=None,
+        copy_error=None,
+    ):
         # objects: dict[key] -> str body
         # page_size: if set, list_objects_v2 simulates S3's real pagination
         # behavior (max 1000 keys per call in production) by only returning
@@ -50,6 +59,21 @@ class FakeS3:
         self.put_calls = []
         self.page_size = page_size
         self.list_calls = []
+        self.head_calls = []
+        self.copy_calls = []
+        self.head_error = head_error
+        self.copy_error = copy_error
+        self.object_heads = {}
+        for key, body in self.objects.items():
+            body_bytes = body.encode("utf-8") if isinstance(body, str) else body
+            self.object_heads[key] = {
+                "ETag": '"etag-current"',
+                "ContentLength": len(body_bytes),
+                "ContentType": "application/octet-stream",
+                "Metadata": {},
+            }
+        for key, response in (object_heads or {}).items():
+            self.object_heads.setdefault(key, {}).update(response)
 
     def get_object(self, Bucket, Key):
         body = self.objects[Key]
@@ -59,6 +83,21 @@ class FakeS3:
         text = Body.decode("utf-8") if isinstance(Body, bytes) else Body
         self.objects[Key] = text
         self.put_calls.append({"Bucket": Bucket, "Key": Key, "Body": text, "ContentType": ContentType})
+
+    def head_object(self, Bucket, Key):
+        self.head_calls.append({"Bucket": Bucket, "Key": Key})
+        if self.head_error:
+            raise self.head_error
+        return dict(self.object_heads[Key])
+
+    def copy_object(self, **kwargs):
+        self.copy_calls.append(kwargs)
+        if self.copy_error:
+            raise self.copy_error
+        head = self.object_heads[kwargs["Key"]]
+        head["CacheControl"] = kwargs["CacheControl"]
+        head["Metadata"] = dict(kwargs["Metadata"])
+        return {"CopyObjectResult": {"ETag": head["ETag"]}}
 
     def list_objects_v2(self, Bucket, ContinuationToken=None):
         self.list_calls.append(ContinuationToken)
@@ -122,8 +161,25 @@ def _make_boto3_client_stub(fakes):
     return _stub
 
 
-def _s3_created_event(bucket, key):
-    return {"Records": [{"s3": {"bucket": {"name": bucket}, "object": {"key": key}}}]}
+class FakeS3ServiceError(Exception):
+    def __init__(self, code, status_code):
+        super().__init__(code)
+        self.response = {
+            "Error": {"Code": code, "Message": code},
+            "ResponseMetadata": {"HTTPStatusCode": status_code},
+        }
+
+
+def _s3_created_event(bucket, key, *, event_name=None, etag=None, version_id=None):
+    object_info = {"key": key}
+    if etag is not None:
+        object_info["eTag"] = etag
+    if version_id is not None:
+        object_info["versionId"] = version_id
+    record = {"s3": {"bucket": {"name": bucket}, "object": object_info}}
+    if event_name is not None:
+        record["eventName"] = event_name
+    return {"Records": [record]}
 
 
 class PublishToKvsRetryTests(unittest.TestCase):
@@ -513,6 +569,390 @@ class HandlerIntegrationTests(unittest.TestCase):
         redirects = _load_redirects_from_kvs(kvs.stored)
         self.assertEqual(len(redirects), 1)
         self.assertEqual(redirects[0]["from"], "/old/")
+
+
+class CacheControlHandlerIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.env_patcher = patch.dict(
+            "os.environ",
+            {
+                "DEFAULT_CACHE_CONTROL": "public, max-age=60",
+                "HISTORY_PREFIX": "_control-history",
+            },
+            clear=False,
+        )
+        self.env_patcher.start()
+
+    def tearDown(self):
+        self.env_patcher.stop()
+
+    def test_handler_adds_default_cache_control_and_preserves_object_metadata(self):
+        expires = dt.datetime(2027, 1, 2, 3, 4, 5, tzinfo=dt.timezone.utc)
+        s3 = FakeS3(
+            {"assets/app.js": "console.log('ok')"},
+            object_heads={
+                "assets/app.js": {
+                    "ETag": '"etag-current"',
+                    "VersionId": "version-3",
+                    "ContentLength": 17,
+                    "Metadata": {"uploaded-by": "cms", "build": "42"},
+                    "ContentType": "text/javascript; charset=utf-8",
+                    "ContentEncoding": "gzip",
+                    "ContentDisposition": 'inline; filename="app.js"',
+                    "ContentLanguage": "ja",
+                    "Expires": expires,
+                    "WebsiteRedirectLocation": "/assets/current.js",
+                    "StorageClass": "INTELLIGENT_TIERING",
+                    "ServerSideEncryption": "aws:kms",
+                    "SSEKMSKeyId": "arn:aws:kms:ap-northeast-1:123456789012:key/test",
+                    "BucketKeyEnabled": True,
+                }
+            },
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "assets/app.js",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+            version_id="version-3",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(
+            result["results"][0],
+            {
+                "bucket": "my-bucket",
+                "key": "assets/app.js",
+                "status": "cache-control-updated",
+                "cacheControl": "public, max-age=60",
+            },
+        )
+        # The current-version check must not include VersionId; otherwise it
+        # would only prove that an old event version still exists.
+        self.assertEqual(s3.head_calls, [{"Bucket": "my-bucket", "Key": "assets/app.js"}])
+        self.assertEqual(len(s3.copy_calls), 1)
+        copy_call = s3.copy_calls[0]
+        self.assertEqual(
+            copy_call["CopySource"],
+            {"Bucket": "my-bucket", "Key": "assets/app.js", "VersionId": "version-3"},
+        )
+        self.assertEqual(copy_call["CopySourceIfMatch"], '"etag-current"')
+        self.assertEqual(copy_call["IfMatch"], '"etag-current"')
+        self.assertEqual(copy_call["MetadataDirective"], "REPLACE")
+        self.assertEqual(copy_call["TaggingDirective"], "COPY")
+        self.assertEqual(copy_call["AnnotationDirective"], "EXCLUDE")
+        self.assertEqual(copy_call["CacheControl"], "public, max-age=60")
+        self.assertEqual(copy_call["Metadata"], {"uploaded-by": "cms", "build": "42"})
+        for field in (
+            "ContentType",
+            "ContentEncoding",
+            "ContentDisposition",
+            "ContentLanguage",
+            "Expires",
+            "WebsiteRedirectLocation",
+            "StorageClass",
+            "ServerSideEncryption",
+            "SSEKMSKeyId",
+            "BucketKeyEnabled",
+        ):
+            self.assertEqual(copy_call[field], s3.object_heads["assets/app.js"][field])
+
+    def test_handler_accepts_each_non_copy_content_upload_event(self):
+        for event_name in (
+            "ObjectCreated:Put",
+            "ObjectCreated:Post",
+            "ObjectCreated:CompleteMultipartUpload",
+        ):
+            with self.subTest(event_name=event_name):
+                s3 = FakeS3({"index.html": "<html></html>"})
+                event = _s3_created_event(
+                    "my-bucket",
+                    "index.html",
+                    event_name=event_name,
+                    etag="etag-current",
+                )
+                with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+                    result = hb.handler(event, None)
+
+                self.assertEqual(result["results"][0]["status"], "cache-control-updated")
+                self.assertEqual(len(s3.copy_calls), 1)
+
+    def test_handler_targets_current_null_version_when_versioning_is_suspended(self):
+        s3 = FakeS3(
+            {"index.html": "<html></html>"},
+            object_heads={"index.html": {"VersionId": "null"}},
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-updated")
+        self.assertEqual(s3.copy_calls[0]["CopySource"]["VersionId"], "null")
+
+    def test_handler_uses_configured_cache_control_value(self):
+        s3 = FakeS3({"index.html": "<html></html>"})
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+        )
+
+        with patch.dict("os.environ", {"DEFAULT_CACHE_CONTROL": "public, max-age=120"}):
+            with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+                result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["cacheControl"], "public, max-age=120")
+        self.assertEqual(s3.copy_calls[0]["CacheControl"], "public, max-age=120")
+
+    def test_handler_preserves_explicit_cache_control_without_copying(self):
+        s3 = FakeS3(
+            {"assets/app.js": "console.log('ok')"},
+            object_heads={
+                "assets/app.js": {"CacheControl": "public, max-age=31536000, immutable"}
+            },
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "assets/app.js",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-preserved")
+        self.assertEqual(
+            result["results"][0]["cacheControl"], "public, max-age=31536000, immutable"
+        )
+        self.assertEqual(s3.copy_calls, [])
+
+    def test_handler_skips_out_of_order_event_when_etag_is_not_current(self):
+        s3 = FakeS3(
+            {"index.html": "new"},
+            object_heads={"index.html": {"ETag": '"etag-new"'}},
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-old",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-stale")
+        self.assertEqual(result["results"][0]["reason"], "etag-mismatch")
+        self.assertEqual(s3.copy_calls, [])
+
+    def test_handler_skips_out_of_order_version_even_when_content_etag_matches(self):
+        s3 = FakeS3(
+            {"index.html": "same-content"},
+            object_heads={"index.html": {"VersionId": "version-new"}},
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+            version_id="version-old",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-stale")
+        self.assertEqual(result["results"][0]["reason"], "version-mismatch")
+        self.assertEqual(s3.copy_calls, [])
+
+    def test_handler_treats_failed_copy_precondition_as_stale(self):
+        s3 = FakeS3(
+            {"index.html": "<html></html>"},
+            copy_error=FakeS3ServiceError("PreconditionFailed", 412),
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+        )
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-stale")
+        self.assertEqual(result["results"][0]["reason"], "PreconditionFailed")
+
+    def test_handler_propagates_conditional_request_conflict_for_async_retry(self):
+        conflict = FakeS3ServiceError("ConditionalRequestConflict", 409)
+        s3 = FakeS3(
+            {"index.html": "<html></html>"},
+            copy_error=conflict,
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            with self.assertRaises(FakeS3ServiceError) as raised:
+                hb.handler(event, None)
+
+        self.assertIs(raised.exception, conflict)
+
+    def test_handler_treats_deleted_object_as_stale(self):
+        s3 = FakeS3(head_error=FakeS3ServiceError("NoSuchKey", 404))
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-deleted",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-stale")
+        self.assertEqual(result["results"][0]["reason"], "NoSuchKey")
+        self.assertEqual(s3.copy_calls, [])
+
+    def test_handler_propagates_non_conflict_s3_errors_for_async_retry(self):
+        s3 = FakeS3(
+            {"index.html": "<html></html>"},
+            copy_error=FakeS3ServiceError("InternalError", 500),
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            with self.assertRaises(FakeS3ServiceError):
+                hb.handler(event, None)
+
+    def test_handler_rejects_empty_default_cache_control(self):
+        s3 = FakeS3({"index.html": "<html></html>"})
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+        )
+
+        with patch.dict("os.environ", {"DEFAULT_CACHE_CONTROL": "   "}):
+            with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+                with self.assertRaisesRegex(ValueError, "DEFAULT_CACHE_CONTROL must not be empty"):
+                    hb.handler(event, None)
+
+        self.assertEqual(s3.head_calls, [])
+        self.assertEqual(s3.copy_calls, [])
+
+    def test_handler_skips_malformed_content_event_without_etag(self):
+        s3 = FakeS3({"index.html": "<html></html>"})
+        event = _s3_created_event(
+            "my-bucket",
+            "index.html",
+            event_name="ObjectCreated:Put",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-skipped")
+        self.assertEqual(result["results"][0]["reason"], "event-etag-missing")
+        self.assertEqual(s3.head_calls, [])
+        self.assertEqual(s3.copy_calls, [])
+
+    def test_handler_skips_object_larger_than_single_copy_limit(self):
+        s3 = FakeS3(
+            {"video/large.mp4": "placeholder"},
+            object_heads={
+                "video/large.mp4": {"ContentLength": hb.S3_COPY_OBJECT_MAX_BYTES + 1}
+            },
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "video/large.mp4",
+            event_name="ObjectCreated:CompleteMultipartUpload",
+            etag="etag-current",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-skipped")
+        self.assertEqual(result["results"][0]["reason"], "object-exceeds-copy-object-limit")
+        self.assertEqual(result["results"][0]["objectSize"], hb.S3_COPY_OBJECT_MAX_BYTES + 1)
+        self.assertEqual(s3.copy_calls, [])
+
+    def test_handler_skips_object_when_head_exposes_object_lock_settings(self):
+        s3 = FakeS3(
+            {"records/report.pdf": "locked"},
+            object_heads={
+                "records/report.pdf": {
+                    "ObjectLockMode": "COMPLIANCE",
+                    "ObjectLockRetainUntilDate": dt.datetime(
+                        2030, 1, 1, tzinfo=dt.timezone.utc
+                    ),
+                }
+            },
+        )
+        event = _s3_created_event(
+            "my-bucket",
+            "records/report.pdf",
+            event_name="ObjectCreated:Put",
+            etag="etag-current",
+        )
+
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+            result = hb.handler(event, None)
+
+        self.assertEqual(result["results"][0]["status"], "cache-control-skipped")
+        self.assertEqual(result["results"][0]["reason"], "object-lock-unsupported")
+        self.assertEqual(
+            result["results"][0]["objectLockFields"],
+            ["ObjectLockMode", "ObjectLockRetainUntilDate"],
+        )
+        self.assertEqual(s3.copy_calls, [])
+
+    def test_handler_skips_copy_delete_history_and_literal_control_file_events(self):
+        cases = (
+            ("assets/app.js", "ObjectCreated:Copy", {}),
+            ("assets/app.js", "ObjectRemoved:Delete", {}),
+            ("_control-history/published/config.json", "ObjectCreated:Put", {}),
+            # With a custom RULES_KEY, literal .htaccess is no longer the
+            # configured rules key but must still never be treated as content.
+            ("nested/.htaccess", "ObjectCreated:Put", {"RULES_KEY": "config/rules.conf"}),
+        )
+        for key, event_name, extra_env in cases:
+            with self.subTest(key=key, event_name=event_name):
+                s3 = FakeS3({key: "placeholder"})
+                event = _s3_created_event(
+                    "my-bucket",
+                    key,
+                    event_name=event_name,
+                    etag="etag-current",
+                )
+                with patch.dict("os.environ", extra_env):
+                    with patch.object(hb, "_boto3_client", _make_boto3_client_stub({"s3": s3})):
+                        result = hb.handler(event, None)
+
+                self.assertEqual(result["results"][0]["status"], "skipped")
+                self.assertEqual(s3.head_calls, [])
+                self.assertEqual(s3.copy_calls, [])
 
 
 if __name__ == "__main__":
