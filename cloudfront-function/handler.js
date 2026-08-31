@@ -86,7 +86,10 @@ async function loadBinPackedRules(name) {
 
 async function loadKvsJson(key, fallback) {
   try {
-    return JSON.parse(await kvs.get(key));
+    // CloudFront Functions JavaScript 2.0 does not support an await
+    // expression directly inside another function's argument list.
+    var value = await kvs.get(key);
+    return JSON.parse(value);
   } catch (e) {
     return fallback;
   }
