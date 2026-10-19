@@ -24,18 +24,22 @@ async function handler(event) {
     return unauthorized(authScope);
   }
 
-  var redirect = findRedirect(uri, config.redirects || []);
+  var redirect = findRedirect(uri, config.redirects || [], request.headers || {});
   if (redirect) {
     if (!isSafeRedirectLocation(redirect.location)) {
       return forbidden();
     }
-    return {
+    var response = {
       statusCode: redirect.status,
       statusDescription: redirect.status === 301 ? 'Moved Permanently' : 'Found',
       headers: {
         location: { value: redirect.location }
       }
     };
+    if (redirect.conditional) {
+      response.headers['cache-control'] = { value: 'no-store' };
+    }
+    return response;
   }
 
   request.uri = resolveIndexDocument(uri, config.directoryIndexScopes || []);
@@ -219,12 +223,27 @@ function forbidden() {
   };
 }
 
-function findRedirect(uri, rules) {
+function matchesRefererConditions(conditions, headers) {
+  var referer = headers.referer;
+  var value = referer ? referer.value : '';
+  for (var i = 0; i < conditions.length; i++) {
+    var condition = conditions[i];
+    var matches = new RegExp(condition.pattern, condition.ignoreCase ? 'i' : '').test(value);
+    if (condition.negate ? matches : !matches) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function findRedirect(uri, rules, headers) {
+  var conditional = false;
   for (var i = 0; i < rules.length; i++) {
     var rule = rules[i];
     if (rule.type === 'redirect' && startsWith(uri, rule.from)) {
       return {
         status: rule.status,
+        conditional: conditional,
         location: appendRemainder(uri, rule.from, rule.to)
       };
     }
@@ -236,8 +255,15 @@ function findRedirect(uri, rules) {
       var relativePath = basePath === '/' ? uri.substring(1) : uri.substring(basePath.length);
       var re = new RegExp(rule.pattern);
       if (re.test(relativePath)) {
+        var conditions = rule.conditions || [];
+        // A fallback redirect can also depend on a preceding failed condition.
+        conditional = conditional || conditions.length > 0;
+        if (!matchesRefererConditions(conditions, headers || {})) {
+          continue;
+        }
         return {
           status: rule.status,
+          conditional: conditional,
           location: relativePath.replace(re, rule.to)
         };
       }

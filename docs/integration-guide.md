@@ -510,7 +510,7 @@ aws cloudfront update-distribution \
 
 If the behavior already has a viewer-request function, do not replace it. Merge the logic from `cloudfront-function/handler.js` into the existing function generator because only one can be associated per behavior.
 
-Use the `CloudFrontFunctionArn` stack output for a direct association. When merging, preserve this order: protected-path blocking, Basic auth, redirects, `DirectoryIndex`, then existing rewrite logic.
+Use the `CloudFrontFunctionArn` stack output for a direct association. When merging, preserve this order: protected-path blocking, Basic auth, redirects (including Referer conditions), `DirectoryIndex`, then existing rewrite logic.
 
 For environments managed by CDK or Terraform, use the resource and association steps above as the contract and implement the equivalent configuration in the existing IaC.
 

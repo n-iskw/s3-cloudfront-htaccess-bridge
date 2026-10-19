@@ -17,3 +17,8 @@ RedirectTemp /tmp/ /maintenance/
 # Optional simple rewrite redirect
 RewriteEngine On
 RewriteRule ^docs/(.*)$ /manual/$1 [R=301,L]
+
+# Only allow this page when reached from the specified entrance page.
+# Upload access-error.html as normal content; it must not match this rule.
+RewriteCond %{HTTP_REFERER} !^https://example\.com/entrance\.html(\?.*)?$
+RewriteRule ^secret\.html$ /access-error.html [R=302,L]
