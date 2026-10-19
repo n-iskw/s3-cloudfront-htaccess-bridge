@@ -371,6 +371,7 @@ var loadKvsJson = extractAsyncFunction('loadKvsJson', 'key, fallback');
 var loadBinPackedRules = extractAsyncFunction('loadBinPackedRules', 'name');
 
 async function runAsyncTests() {
+  await require('./test_referer_conditions')();
   // Case 1: no meta key at all (e.g. a brand new site with zero redirects
   // ever published) falls back to chunkCount 0, yielding an empty list
   // without attempting to fetch any chunk key.

@@ -386,6 +386,25 @@ class HandlerIntegrationTests(unittest.TestCase):
         self.assertEqual(rejected_payload["status"], "rejected")
         self.assertIn("unsupported directive", rejected_payload["error"])
 
+    def test_invalid_referer_update_retains_last_published_conditions(self):
+        valid = r'''RewriteEngine On
+RewriteCond %{HTTP_REFERER} !^https://example\.com/
+RewriteRule ^secret\.html$ /access-error.html [R=302,L]'''
+        s3 = FakeS3({".htaccess": valid})
+        kvs = FakeKVS()
+        with patch.object(hb, "_boto3_client", _make_boto3_client_stub(
+            {"s3": s3, "cloudfront-keyvaluestore": kvs}
+        )), contextlib.redirect_stdout(io.StringIO()):
+            published = hb.handler(_s3_created_event("my-bucket", ".htaccess"), None)
+            self.assertEqual(published['results'][0]['status'], 'published')
+            previous = dict(kvs.stored)
+            self.assertTrue(_load_redirects_from_kvs(previous)[0]['conditions'])
+            s3.objects['.htaccess'] = valid.replace('%{HTTP_REFERER}', '%{HTTP_HOST}')
+            rejected = hb.handler(_s3_created_event("my-bucket", ".htaccess"), None)
+        self.assertEqual(rejected['results'][0]['status'], 'rejected')
+        self.assertEqual(kvs.stored, previous)
+        self.assertTrue(rejected['results'][0]['historyKey'].startswith('_control-history/rejected/'))
+
     def test_handler_rejects_maintenance_without_htpasswd(self):
         s3 = FakeS3(
             {

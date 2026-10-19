@@ -85,6 +85,29 @@ Redirect 302 /campaign /campaign/
 
 この設定は loop する可能性があるため rejected になります。
 
+### Refererによる個別エラーページへの転送
+
+ルートの `.htaccess` で、`/secret.html` を特定ページからの遷移に限定する例です。
+`/access-error.html` も通常のコンテンツとしてアップロードしてください。
+
+```apache
+RewriteEngine On
+RewriteCond %{HTTP_REFERER} !^https://example\.com/entrance\.html(\?.*)?$
+RewriteRule ^secret\.html$ /access-error.html [R=302,L]
+```
+
+`/entrance.html`（クエリ付きも可）からの遷移だけ通し、Refererなし・別ページからの
+アクセスは302転送します。他のページには影響しません。URLが転送先へ変わり、
+エラーページ自体は通常200で配信されます。S3の403カスタムエラーは経由しません。
+Refererがないアクセスだけを転送したい場合は、条件を `RewriteCond %{HTTP_REFERER} ^$`
+に置き換えます。下位 `.htaccess` の `RewriteRule` は配置ディレクトリからの相対パスです。
+
+条件の先頭の `!` は否定、条件行末の `[NC]` は大文字小文字を区別しない指定です。
+複数の条件行はANDで結合し、直後の1つの `RewriteRule` だけに適用します。
+条件付き転送は `Cache-Control: no-store` を返します。転送先を条件の対象に含めないでください。
+判定対象はDirectoryIndex書き換え前のURLなので、同じページへの別URLも必要に応じてルールに含めます。
+Refererは省略・偽装できるため、認証や機密情報の保護には使えません。
+
 ### DirectoryIndex（ディレクトリのデフォルトドキュメント）
 
 ディレクトリへのアクセス時にどのファイルを表示するかを指定できます。
@@ -212,6 +235,30 @@ Redirect 302 /campaign /campaign/
 ```
 
 This can loop and will be rejected.
+
+### Referer-conditioned redirects to an individual error page
+
+In the root `.htaccess`, allow `/secret.html` only when reached from a specific page:
+
+```apache
+RewriteEngine On
+RewriteCond %{HTTP_REFERER} !^https://example\.com/entrance\.html(\?.*)?$
+RewriteRule ^secret\.html$ /access-error.html [R=302,L]
+```
+
+Upload `/access-error.html` as ordinary content. The allowed entrance page (including
+query strings) passes through; missing Referer or any other page causes a 302 redirect.
+Other paths are unaffected. The browser URL changes and the destination normally returns
+200; S3's custom 403 error mapping is not involved. To redirect only requests without a
+Referer, replace the condition with `RewriteCond %{HTTP_REFERER} ^$`.
+In nested `.htaccess` files, `RewriteRule` matches relative to that directory.
+
+`!` negates a condition and optional `[NC]` makes it case-insensitive. Consecutive
+conditions are ANDed and apply only to the immediately following `RewriteRule`.
+Conditional redirects return `Cache-Control: no-store`. Keep the error destination
+outside the matched paths. Matching precedes DirectoryIndex rewriting: include other
+URLs that lead to the same content in your rules when necessary.
+Referer can be omitted or forged; this is navigation control, not authentication.
 
 ### DirectoryIndex (default document for a directory)
 

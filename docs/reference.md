@@ -150,9 +150,23 @@ RewriteRule ^old/(.*)$ /new/$1 [R=301,L]
 | `RewriteEngine Off` | 限定対応 | 許可。以後の `RewriteRule` は再度 `On` まで rejected |
 | `RewriteRule pattern target [R=301,L]` | 限定対応 | redirect のみ |
 | `RewriteRule pattern target [R=302,L]` | 限定対応 | redirect のみ |
+| `RewriteCond %{HTTP_REFERER} [!]regex [NC]` | 限定対応 | Referer正規表現判定のみ。連続した条件はAND、直後のRewriteRuleのみに適用 |
 | nested `RewriteRule` relative matching | 対応 | `.htaccess` が置かれたディレクトリからの相対パスで評価 |
 | `DirectoryIndex local-url [local-url] ...` | 限定対応 | 複数ファイル名を優先順位付きで指定可能。ただし実在確認ができないため常にリストの最初の名前を使う（詳細は下記の注意事項を参照） |
 | `DirectoryIndex disabled` | 限定対応 | そのスコープでは index 探索を行わない。親スコープの設定も適用しない |
+
+#### Referer条件の範囲と更新
+
+記述例は[制作者向けガイド](content-creator-guide.md#refererによる個別エラーページへの転送)を参照してください。
+正規表現は200文字以内で、通常の文字・文字クラス・グループ・`(?:...)`・選択・通常の量指定を使えます。
+`\.` や `\?` など記号のエスケープは保持します。英数字のバックスラッシュエスケープ、
+インラインフラグ、先読み・後読み、所有的量指定、条件のキャプチャ参照・変数展開は対象外です。
+同一パターンの異なる条件は記述順、その他は従来のspecificity順で評価します。
+ループ検証は条件を無視して保守的に行うため、条件によっては到達しないループもrejectedになります。
+
+LambdaとCFFを同じ対応版へ更新してから、新しい構文の `.htaccess` をアップロードしてください。
+固定版を取り込んでいるサイトは個別の版更新が必要です。`[NC]` は条件行のみ対応し、
+`RewriteRule` の対応フラグは引き続き `R` と `L` のみです。
 
 #### 非対応
 
@@ -169,7 +183,7 @@ RewriteRule ^old/(.*)$ /new/$1 [R=301,L]
 | `Require group ...` | 非対応 | グループ認証は対象外 |
 | `Require ip` の IPv6 | 非対応 | 意図的な判断。詳細は下記「IPv6 の対応判断について」を参照 |
 | `Order`, `Allow`, `Deny`, `Satisfy` | 非対応 | Apache 2.2 access-control 互換は対象外 |
-| `RewriteCond` | 非対応 | Apache の実行文脈への依存が大きい。SPA フォールバック用途（`!-f`/`!-d` によるファイル存在判定）はこの実装では実現できない。詳細は「SPA フォールバックについて」を参照 |
+| Referer以外の `RewriteCond`、`[OR]`、条件の後方参照 | 非対応 | ファイル実在判定やApache変数展開は対象外。詳細は「SPA フォールバックについて」を参照 |
 | `RewriteBase` | 非対応 | Lambda が下位 `.htaccess` を正規化 |
 | `FallbackResource` | 非対応 | `RewriteCond` と同じ理由でファイル存在判定に依存するため対応不可。「SPA フォールバックについて」を参照 |
 | `R` と `L` 以外の `RewriteRule` flags | 非対応 | CloudFront Functions の処理を小さく保つ |
@@ -442,9 +456,25 @@ This bridge intentionally implements only the subset needed for maintenance mode
 | `RewriteEngine Off` | Limited | Accepted; following `RewriteRule` is rejected unless `On` appears again |
 | `RewriteRule pattern target [R=301,L]` | Limited | Redirect only |
 | `RewriteRule pattern target [R=302,L]` | Limited | Redirect only |
+| `RewriteCond %{HTTP_REFERER} [!]regex [NC]` | Limited | Referer regex only; consecutive conditions are ANDed onto the next RewriteRule |
 | nested `RewriteRule` relative matching | Yes | Pattern is evaluated relative to the `.htaccess` directory |
 | `DirectoryIndex local-url [local-url] ...` | Limited | Multiple candidate filenames can be specified in priority order. Existence cannot be checked, so the first name in the list is always used (see the note below) |
 | `DirectoryIndex disabled` | Limited | Disables index lookup in that scope and prevents an inherited DirectoryIndex scope from applying |
+
+#### Referer condition limits and upgrades
+
+See the [content creator examples](content-creator-guide.md#referer-conditioned-redirects-to-an-individual-error-page).
+Patterns are limited to 200 characters. Ordinary characters, character classes,
+groups (including `(?:...)`), alternation and non-possessive quantifiers are supported.
+Punctuation escapes such as `\.` and `\?` are preserved. Alphanumeric backslash
+escapes, inline modes, lookarounds, possessive quantifiers, condition capture references
+and variable expansion are unsupported. Different conditions on identical path patterns
+keep declaration order; other rules keep existing specificity ordering. Loop validation
+conservatively ignores conditions and can reject a chain that is unreachable at runtime.
+
+Upgrade both the Lambda and Function to the same supporting release before uploading
+the new syntax. Pinned consumers require an explicit release adoption. `[NC]` is a
+condition flag only; RewriteRule flags remain limited to `R` and `L`.
 
 #### Not Supported
 
@@ -461,7 +491,7 @@ Unsupported directives reject the upload and keep the last published KVS config.
 | `Require group ...` | No | Group auth is out of scope |
 | IPv6 in `Require ip` | No | Deliberate design decision. See "About the IPv6 decision" below for details |
 | `Order`, `Allow`, `Deny`, `Satisfy` | No | Apache 2.2 access-control compatibility is out of scope |
-| `RewriteCond` | No | Conditions are too Apache-context dependent. SPA fallback use cases (file-existence checks with `!-f`/`!-d`) cannot be implemented this way. See "About SPA fallback" |
+| Non-Referer `RewriteCond`, `[OR]`, condition backreferences | No | File-existence checks and Apache variable expansion remain unsupported. See "About SPA fallback" |
 | `RewriteBase` | No | Nested rules are normalized by Lambda instead |
 | `FallbackResource` | No | Same limitation as `RewriteCond` — depends on file-existence checks that this implementation cannot perform. See "About SPA fallback" |
 | internal `RewriteRule` without `R` | No | Only redirects are supported |
