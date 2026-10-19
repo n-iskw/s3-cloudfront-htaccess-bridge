@@ -34,6 +34,7 @@ SUPPORTED_DIRECTIVES = {
     "redirectpermanent",
     "redirecttemp",
     "rewriteengine",
+    "rewritecond",
     "rewriterule",
     "directoryindex",
 }
@@ -75,6 +76,7 @@ def parse_htaccess(
     auth_type_basic = False
     require_valid_user = False
     rewrite_engine_on = False
+    pending_conditions: List[Dict[str, Any]] = []
     directory_index: List[str] = []
     directory_index_disabled = False
     directory_index_configured = False
@@ -83,6 +85,9 @@ def parse_htaccess(
     for line in parsed_lines:
         name = line.directive
         args = line.args
+
+        if pending_conditions and name not in {"rewritecond", "rewriterule"}:
+            raise HtaccessError(f"line {line.line_no}: RewriteCond must be followed by RewriteRule")
 
         if name not in SUPPORTED_DIRECTIVES:
             raise HtaccessError(f"line {line.line_no}: unsupported directive: {line.raw}")
@@ -129,16 +134,28 @@ def parse_htaccess(
                 raise HtaccessError(f"line {line.line_no}: RewriteEngine must be On or Off")
             rewrite_engine_on = value == "on"
 
+        elif name == "rewritecond":
+            if not rewrite_engine_on:
+                raise HtaccessError(f"line {line.line_no}: RewriteCond requires RewriteEngine On")
+            pending_conditions.append(_parse_referer_condition(line))
+
         elif name == "rewriterule":
             if not rewrite_engine_on:
                 raise HtaccessError(f"line {line.line_no}: RewriteRule requires RewriteEngine On")
-            redirects.append(_parse_rewrite_rule(line, allowed_hosts))
+            rule = _parse_rewrite_rule(line, allowed_hosts)
+            if pending_conditions:
+                rule["conditions"] = pending_conditions
+                pending_conditions = []
+            redirects.append(rule)
 
         elif name == "directoryindex":
             directory_index_configured = True
             directory_index, directory_index_disabled = _apply_directory_index(
                 line, directory_index, directory_index_disabled
             )
+
+    if pending_conditions:
+        raise HtaccessError("RewriteCond must be followed by RewriteRule")
 
     maintenance["enabled"] = auth_type_basic and require_valid_user
     if maintenance["enabled"]:
@@ -291,7 +308,8 @@ def validate_config(config: Dict[str, Any]) -> None:
                 )
 
         elif rule_type == "rewrite":
-            key = ("rewrite", rule["pattern"])
+            key = ("rewrite", rule.get("basePath", "/"), rule["pattern"],
+                   _json_dumps(rule.get("conditions", [])))
             if key in seen:
                 raise HtaccessError(f"line {rule.get('line')}: duplicate rewrite pattern: {rule['pattern']}")
             seen.add(key)
@@ -430,7 +448,16 @@ def _read_lines(text: str) -> Iterable[ParsedLine]:
         if not stripped or stripped.startswith("#"):
             continue
         try:
-            tokens = shlex.split(stripped, comments=False, posix=True)
+            if stripped.split(None, 1)[0].lower() in {"rewritecond", "rewriterule"}:
+                # Shell escaping removes regex escapes such as \\. and \\?.
+                # Keep those literal while still supporting quoted arguments.
+                lexer = shlex.shlex(stripped, posix=True)
+                lexer.whitespace_split = True
+                lexer.commenters = ""
+                lexer.escape = ""
+                tokens = list(lexer)
+            else:
+                tokens = shlex.split(stripped, comments=False, posix=True)
         except ValueError as exc:
             raise HtaccessError(f"line {line_no}: cannot parse line: {exc}") from exc
         if not tokens:
@@ -466,6 +493,27 @@ def _redirect_rule(line: ParsedLine, status: int, source: str, target: str, allo
         "match": "prefix",
         "line": line.line_no,
     }
+
+
+def _parse_referer_condition(line: ParsedLine) -> Dict[str, Any]:
+    if len(line.args) not in {2, 3} or line.args[0] != "%{HTTP_REFERER}":
+        raise HtaccessError(f"line {line.line_no}: only RewriteCond %{{HTTP_REFERER}} regex [NC] is supported")
+    flags = _parse_flags(line.args[2] if len(line.args) == 3 else "")
+    if len(line.args) == 3 and line.args[2].lower() != "[nc]":
+        raise HtaccessError(f"line {line.line_no}: only RewriteCond [NC] is supported")
+    pattern = line.args[1]
+    negate = pattern.startswith("!")
+    if negate:
+        pattern = pattern[1:]
+    # Keep a portable regex subset shared by Python validation and JS runtime.
+    # No inline flags, lookarounds, named groups, backreferences or expansions.
+    if (not pattern or re.search(r"\(\?(?!:)", pattern)
+            or re.search(r"\\(?:[A-Za-z0-9])", pattern)
+            or re.search(r"(?:[?*+]|\{[0-9,]+\})\+", pattern)
+            or "%{" in pattern):
+        raise HtaccessError(f"line {line.line_no}: unsupported Referer regex construct")
+    _validate_rewrite_pattern(pattern, line.line_no)
+    return {"pattern": pattern, "negate": negate, "ignoreCase": "nc" in flags}
 
 
 def _parse_rewrite_rule(line: ParsedLine, allowed_hosts: set) -> Dict[str, Any]:
@@ -821,7 +869,7 @@ def _sample_uri_for_rewrite(rule: Dict[str, Any]) -> Optional[str]:
     sample = sample.removeprefix("^").removesuffix("$")
     sample = re.sub(r"\(\.\*\)", "__loop_probe__", sample)
     sample = re.sub(r"\([^)]*\)", "__loop_probe__", sample)
-    sample = sample.replace("\\/", "/")
+    sample = re.sub(r"\\([./_-])", r"\1", sample)
     if any(ch in sample for ch in "[]+?{}|"):
         return None
     if base_path == "/":

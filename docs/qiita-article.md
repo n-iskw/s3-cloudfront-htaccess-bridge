@@ -90,7 +90,7 @@ _control-history/rejected/
 
 Apacheの`.htaccess`を完全に再現しているわけではありません。現在の主な非対応項目は次のとおりです。
 
-- `RewriteCond`
+- Referer正規表現判定以外の `RewriteCond`（`%{HTTP_REFERER}` の条件付き転送は限定対応）
 - SPAフォールバック
 - Digest認証
 - IPv6のアクセスルール
