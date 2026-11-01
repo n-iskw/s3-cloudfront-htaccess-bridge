@@ -85,6 +85,46 @@ Redirect 302 /campaign /campaign/
 
 この設定は loop する可能性があるため rejected になります。
 
+### Referer条件で403を返す
+
+```apache
+RewriteEngine On
+RewriteCond %{HTTP_REFERER} !^https://example\.com/entrance\.html(\?.*)?$
+RewriteRule ^secret\.html$ - [F,L]
+```
+
+許可ページからの遷移は通常配信です。Refererなし・不一致のGET/HEADは、取得先だけを
+共通予約パス `/_htaccess-bridge/forbidden.html` に書き換えます。ブラウザーのURLは変わりません。
+S3 RESTオリジンにはこのオブジェクトを置かず、CloudFrontに `s3:ListBucket` を付与しないことで、
+S3が403を返します。ページ本文・最終ステータス・キャッシュは既存のCloudFrontカスタムエラー設定に従います。
+追加のS3拒否ポリシーやサイト固有のBridge設定は不要です。`[F]` 単独でもルール処理を終了します。
+GET/HEAD以外はFunctionが本文なし403を返し、S3には送信しません。
+導入条件は[組み込みガイド](integration-guide.md#forbidden-rules)を参照してください。
+Refererは偽装・省略できるため、認証には使えません。別名URLも必要に応じてルールで保護してください。
+
+### Refererによる個別エラーページへの転送
+
+ルートの `.htaccess` で、`/secret.html` を特定ページからの遷移に限定する例です。
+`/access-error.html` も通常のコンテンツとしてアップロードしてください。
+
+```apache
+RewriteEngine On
+RewriteCond %{HTTP_REFERER} !^https://example\.com/entrance\.html(\?.*)?$
+RewriteRule ^secret\.html$ /access-error.html [R=302,L]
+```
+
+`/entrance.html`（クエリ付きも可）からの遷移だけ通し、Refererなし・別ページからの
+アクセスは302転送します。他のページには影響しません。URLが転送先へ変わり、
+エラーページ自体は通常200で配信されます。S3の403カスタムエラーは経由しません。
+Refererがないアクセスだけを転送したい場合は、条件を `RewriteCond %{HTTP_REFERER} ^$`
+に置き換えます。下位 `.htaccess` の `RewriteRule` は配置ディレクトリからの相対パスです。
+
+条件の先頭の `!` は否定、条件行末の `[NC]` は大文字小文字を区別しない指定です。
+複数の条件行はANDで結合し、直後の1つの `RewriteRule` だけに適用します。
+条件付き転送は `Cache-Control: no-store` を返します。転送先を条件の対象に含めないでください。
+判定対象はDirectoryIndex書き換え前のURLなので、同じページへの別URLも必要に応じてルールに含めます。
+Refererは省略・偽装できるため、認証や機密情報の保護には使えません。
+
 ### DirectoryIndex（ディレクトリのデフォルトドキュメント）
 
 ディレクトリへのアクセス時にどのファイルを表示するかを指定できます。
@@ -212,6 +252,48 @@ Redirect 302 /campaign /campaign/
 ```
 
 This can loop and will be rejected.
+
+### Referer-based 403 denial
+
+```apache
+RewriteEngine On
+RewriteCond %{HTTP_REFERER} !^https://example\.com/entrance\.html(\?.*)?$
+RewriteRule ^secret\.html$ - [F,L]
+```
+
+The allowed entrance passes through. For a missing or mismatching Referer, GET/HEAD
+requests are internally rewritten to `/_htaccess-bridge/forbidden.html`, without a browser
+redirect. Keep that reserved namespace empty and do not grant CloudFront `s3:ListBucket`
+on the S3 REST origin: the absent key then returns 403. Existing CloudFront custom error
+responses own the page, final status, and error caching. No extra S3 deny policy or
+site-specific Bridge setting is required. `[F]` alone is also terminal. Other methods
+return a direct empty 403 with `Cache-Control: no-store` and never reach S3.
+See the [integration requirements](integration-guide.md#forbidden-rules). Referer can be
+forged or omitted; this is navigation control, not authentication. Cover alternate URLs explicitly.
+
+### Referer-conditioned redirects to an individual error page
+
+In the root `.htaccess`, allow `/secret.html` only when reached from a specific page:
+
+```apache
+RewriteEngine On
+RewriteCond %{HTTP_REFERER} !^https://example\.com/entrance\.html(\?.*)?$
+RewriteRule ^secret\.html$ /access-error.html [R=302,L]
+```
+
+Upload `/access-error.html` as ordinary content. The allowed entrance page (including
+query strings) passes through; missing Referer or any other page causes a 302 redirect.
+Other paths are unaffected. The browser URL changes and the destination normally returns
+200; S3's custom 403 error mapping is not involved. To redirect only requests without a
+Referer, replace the condition with `RewriteCond %{HTTP_REFERER} ^$`.
+In nested `.htaccess` files, `RewriteRule` matches relative to that directory.
+
+`!` negates a condition and optional `[NC]` makes it case-insensitive. Consecutive
+conditions are ANDed and apply only to the immediately following `RewriteRule`.
+Conditional redirects return `Cache-Control: no-store`. Keep the error destination
+outside the matched paths. Matching precedes DirectoryIndex rewriting: include other
+URLs that lead to the same content in your rules when necessary.
+Referer can be omitted or forged; this is navigation control, not authentication.
 
 ### DirectoryIndex (default document for a directory)
 

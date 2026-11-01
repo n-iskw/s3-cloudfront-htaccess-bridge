@@ -510,7 +510,7 @@ aws cloudfront update-distribution \
 
 If the behavior already has a viewer-request function, do not replace it. Merge the logic from `cloudfront-function/handler.js` into the existing function generator because only one can be associated per behavior.
 
-Use the `CloudFrontFunctionArn` stack output for a direct association. When merging, preserve this order: protected-path blocking, Basic auth, redirects, `DirectoryIndex`, then existing rewrite logic.
+Use the `CloudFrontFunctionArn` stack output for a direct association. When merging, preserve this order: protected-path blocking, Basic auth, redirects (including Referer conditions), `DirectoryIndex`, then existing rewrite logic.
 
 For environments managed by CDK or Terraform, use the resource and association steps above as the contract and implement the equivalent configuration in the existing IaC.
 
@@ -550,3 +550,49 @@ aws cloudformation delete-stack \
   --stack-name htaccess-bridge \
   --region "$AWS_REGION"
 ```
+
+<a id="forbidden-rules"></a>
+## `[F]` の導入条件 / Forbidden-rule integration requirements
+
+BridgeはApacheに近い条件判定と拒否の指定を扱い、エラー表示はCloudFrontに任せます。
+`RewriteRule pattern - [F,L]` または `[F]` に一致したGET/HEADは、共通の
+`/_htaccess-bridge/forbidden.html` へ取得先だけを書き換えます。クエリ文字列は除去し、
+DirectoryIndex・後続ルールは適用しません。ブラウザーへのリダイレクトはありません。
+
+- 対象はS3 RESTオリジンです。S3 website endpointや別種のオリジンは対象外です。
+- 各オリジンの `/_htaccess-bridge/` は予約領域として空に保ちます。OriginPathを指定した場合は、
+  そのプレフィックス配下で同じ予約領域を空に保ちます。オブジェクトを置くと拒否の代わりに
+  配信され得るため、公開前に不在を確認してください。
+- CloudFrontのS3アクセス主体には `s3:ListBucket` を付与しません。存在しないキーは403になります。
+  Bridge同期Lambdaやアップロード担当者のListBucket権限とは別です。
+- ページ本文・最終HTTPステータス・エラーキャッシュは既存のDistribution設定を利用します。
+  設定がなければS3の403が通常のCloudFrontエラー処理へ進みます。
+- URIの変更では選択済みのcache behaviorやoriginは変わりません。複数オリジンの場合は、
+  対象のすべてで上記の条件を満たしてください。
+- GET/HEAD以外はS3へ転送せず、Functionが本文なし403と `Cache-Control: no-store` を返します。
+  この応答にはCloudFrontのカスタムエラー設定は適用されません。
+- 更新時はLambdaとFunctionを同じリリースへそろえてから新構文をアップロードしてください。
+  Bridgeは `ErrorDocument` を解釈せず、DistributionやS3ポリシーも変更しません。
+
+The Bridge handles Apache-like matching and denial; CloudFront handles error presentation.
+A GET/HEAD matched by `[F]` or `[F,L]` is internally rewritten to the fixed absent object
+`/_htaccess-bridge/forbidden.html`. Its query string is cleared and processing stops
+before DirectoryIndex or later rules, without issuing a viewer redirect.
+
+Use S3 REST origins only. Reserve the entire `/_htaccess-bridge/` namespace in every
+applicable origin (under its OriginPath, if configured), keep it empty, and verify
+absence before enabling the feature. An object there could be served instead of denied.
+Do not grant the CloudFront S3 principal `s3:ListBucket`; this is independent of the sync
+Lambda's or uploader's permissions. A missing key then returns 403. Existing Distribution
+custom error responses determine the body, final viewer status, and caching. With no
+custom mapping, the origin 403 follows normal CloudFront error handling.
+
+Changing the URI does not select a different cache behavior or origin, so all applicable
+origins must satisfy this contract. Non-GET/HEAD methods receive a direct empty 403 with
+`Cache-Control: no-store` and never reach S3; custom error pages do not apply to that
+response. Upgrade the Lambda and Function together before uploading new syntax.
+No site URL, error-document path, Distribution edit, S3 deny policy, or `ErrorDocument`
+emulation is part of the implementation.
+
+Sources: [S3 GetObject missing-key behavior](https://docs.aws.amazon.com/AmazonS3/latest/API/API_GetObject.html),
+[CloudFront URI changes and Function-generated errors](https://docs.aws.amazon.com/AmazonCloudFront/latest/DeveloperGuide/functions-event-structure.html).

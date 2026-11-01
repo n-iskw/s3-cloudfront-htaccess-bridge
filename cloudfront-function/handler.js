@@ -2,6 +2,9 @@ import cf from 'cloudfront';
 import crypto from 'crypto';
 
 var kvs = cf.kvs();
+// Reserved, absent object in every integrated S3 REST origin. CloudFront owns
+// the resulting origin error's page, status mapping, and cache policy.
+var FORBIDDEN_ORIGIN_URI = '/_htaccess-bridge/forbidden.html';
 
 async function handler(event) {
   var request = event.request;
@@ -24,18 +27,32 @@ async function handler(event) {
     return unauthorized(authScope);
   }
 
-  var redirect = findRedirect(uri, config.redirects || []);
+  var redirect = findRedirect(uri, config.redirects || [], request.headers || {});
   if (redirect) {
+    if (redirect.status === 403) {
+      // Only GET/HEAD have S3's missing-object semantics. Never send a denied
+      // write or CORS preflight to the reserved key.
+      if (request.method && request.method !== 'GET' && request.method !== 'HEAD') {
+        return forbidden();
+      }
+      request.uri = FORBIDDEN_ORIGIN_URI;
+      request.querystring = {};
+      return request;
+    }
     if (!isSafeRedirectLocation(redirect.location)) {
       return forbidden();
     }
-    return {
+    var response = {
       statusCode: redirect.status,
       statusDescription: redirect.status === 301 ? 'Moved Permanently' : 'Found',
       headers: {
         location: { value: redirect.location }
       }
     };
+    if (redirect.conditional) {
+      response.headers['cache-control'] = { value: 'no-store' };
+    }
+    return response;
   }
 
   request.uri = resolveIndexDocument(uri, config.directoryIndexScopes || []);
@@ -219,16 +236,31 @@ function forbidden() {
   };
 }
 
-function findRedirect(uri, rules) {
+function matchesRefererConditions(conditions, headers) {
+  var referer = headers.referer;
+  var value = referer ? referer.value : '';
+  for (var i = 0; i < conditions.length; i++) {
+    var condition = conditions[i];
+    var matches = new RegExp(condition.pattern, condition.ignoreCase ? 'i' : '').test(value);
+    if (condition.negate ? matches : !matches) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function findRedirect(uri, rules, headers) {
+  var conditional = false;
   for (var i = 0; i < rules.length; i++) {
     var rule = rules[i];
     if (rule.type === 'redirect' && startsWith(uri, rule.from)) {
       return {
         status: rule.status,
+        conditional: conditional,
         location: appendRemainder(uri, rule.from, rule.to)
       };
     }
-    if (rule.type === 'rewrite') {
+    if (rule.type === 'rewrite' || rule.type === 'forbidden') {
       var basePath = rule.basePath || '/';
       if (!startsWith(uri, basePath)) {
         continue;
@@ -236,8 +268,18 @@ function findRedirect(uri, rules) {
       var relativePath = basePath === '/' ? uri.substring(1) : uri.substring(basePath.length);
       var re = new RegExp(rule.pattern);
       if (re.test(relativePath)) {
+        var conditions = rule.conditions || [];
+        // A fallback redirect can also depend on a preceding failed condition.
+        conditional = conditional || conditions.length > 0;
+        if (!matchesRefererConditions(conditions, headers || {})) {
+          continue;
+        }
+        if (rule.type === 'forbidden') {
+          return { status: 403 };
+        }
         return {
           status: rule.status,
+          conditional: conditional,
           location: relativePath.replace(re, rule.to)
         };
       }
