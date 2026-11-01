@@ -292,7 +292,7 @@ def validate_config(config: Dict[str, Any]) -> None:
     for rule in config.get("redirects", []):
         rule_type = rule.get("type")
         status = int(rule.get("status", 0))
-        if status not in REDIRECT_STATUSES:
+        if status not in ({403} if rule_type == "forbidden" else REDIRECT_STATUSES):
             raise HtaccessError(f"line {rule.get('line')}: unsupported redirect status: {status}")
 
         if rule_type == "redirect":
@@ -307,7 +307,7 @@ def validate_config(config: Dict[str, Any]) -> None:
                     f"line {rule.get('line')}: redirect target can loop: {source} -> {target}"
                 )
 
-        elif rule_type == "rewrite":
+        elif rule_type in {"rewrite", "forbidden"}:
             key = ("rewrite", rule.get("basePath", "/"), rule["pattern"],
                    _json_dumps(rule.get("conditions", [])))
             if key in seen:
@@ -522,11 +522,21 @@ def _parse_rewrite_rule(line: ParsedLine, allowed_hosts: set) -> Dict[str, Any]:
     pattern = line.args[0]
     target = line.args[1]
     flags = _parse_flags(line.args[2] if len(line.args) == 3 else "")
-    unsupported_flags = sorted(set(flags) - {"r", "l"})
+    unsupported_flags = sorted(set(flags) - {"r", "l", "f"})
     if unsupported_flags:
         raise HtaccessError(
             f"line {line.line_no}: unsupported RewriteRule flag(s): {', '.join(unsupported_flags)}"
         )
+    if "f" in flags:
+        if target != "-" or "r" in flags or any(value != "true" for value in flags.values()):
+            raise HtaccessError(f"line {line.line_no}: forbidden rules require substitution - and bare [F] or [F,L]")
+        _validate_rewrite_pattern(pattern, line.line_no)
+        return {
+            "type": "forbidden",
+            "pattern": pattern,
+            "status": 403,
+            "line": line.line_no,
+        }
     status = flags.get("r")
     if not status:
         raise HtaccessError(f"line {line.line_no}: only RewriteRule redirects with [R=...] are supported")

@@ -150,6 +150,7 @@ RewriteRule ^old/(.*)$ /new/$1 [R=301,L]
 | `RewriteEngine Off` | 限定対応 | 許可。以後の `RewriteRule` は再度 `On` まで rejected |
 | `RewriteRule pattern target [R=301,L]` | 限定対応 | redirect のみ |
 | `RewriteRule pattern target [R=302,L]` | 限定対応 | redirect のみ |
+| `RewriteRule pattern - [F,L]` / `[F]` | 限定対応 | GET/HEADは予約済みの存在しないS3キーへ内部書き換え。S3の403と既存CloudFrontエラー設定を利用。他メソッドは直接403。導入条件は[組み込みガイド](integration-guide.md#forbidden-rules)を参照 |
 | `RewriteCond %{HTTP_REFERER} [!]regex [NC]` | 限定対応 | Referer正規表現判定のみ。連続した条件はAND、直後のRewriteRuleのみに適用 |
 | nested `RewriteRule` relative matching | 対応 | `.htaccess` が置かれたディレクトリからの相対パスで評価 |
 | `DirectoryIndex local-url [local-url] ...` | 限定対応 | 複数ファイル名を優先順位付きで指定可能。ただし実在確認ができないため常にリストの最初の名前を使う（詳細は下記の注意事項を参照） |
@@ -456,6 +457,7 @@ This bridge intentionally implements only the subset needed for maintenance mode
 | `RewriteEngine Off` | Limited | Accepted; following `RewriteRule` is rejected unless `On` appears again |
 | `RewriteRule pattern target [R=301,L]` | Limited | Redirect only |
 | `RewriteRule pattern target [R=302,L]` | Limited | Redirect only |
+| `RewriteRule pattern - [F,L]` / `[F]` | Limited | GET/HEAD rewrite to a reserved absent S3 key, using origin 403 and existing CloudFront error settings. Other methods return direct 403. See [integration requirements](integration-guide.md#forbidden-rules) |
 | `RewriteCond %{HTTP_REFERER} [!]regex [NC]` | Limited | Referer regex only; consecutive conditions are ANDed onto the next RewriteRule |
 | nested `RewriteRule` relative matching | Yes | Pattern is evaluated relative to the `.htaccess` directory |
 | `DirectoryIndex local-url [local-url] ...` | Limited | Multiple candidate filenames can be specified in priority order. Existence cannot be checked, so the first name in the list is always used (see the note below) |

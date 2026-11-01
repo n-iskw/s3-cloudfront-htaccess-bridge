@@ -2,6 +2,9 @@ import cf from 'cloudfront';
 import crypto from 'crypto';
 
 var kvs = cf.kvs();
+// Reserved, absent object in every integrated S3 REST origin. CloudFront owns
+// the resulting origin error's page, status mapping, and cache policy.
+var FORBIDDEN_ORIGIN_URI = '/_htaccess-bridge/forbidden.html';
 
 async function handler(event) {
   var request = event.request;
@@ -26,6 +29,16 @@ async function handler(event) {
 
   var redirect = findRedirect(uri, config.redirects || [], request.headers || {});
   if (redirect) {
+    if (redirect.status === 403) {
+      // Only GET/HEAD have S3's missing-object semantics. Never send a denied
+      // write or CORS preflight to the reserved key.
+      if (request.method && request.method !== 'GET' && request.method !== 'HEAD') {
+        return forbidden();
+      }
+      request.uri = FORBIDDEN_ORIGIN_URI;
+      request.querystring = {};
+      return request;
+    }
     if (!isSafeRedirectLocation(redirect.location)) {
       return forbidden();
     }
@@ -247,7 +260,7 @@ function findRedirect(uri, rules, headers) {
         location: appendRemainder(uri, rule.from, rule.to)
       };
     }
-    if (rule.type === 'rewrite') {
+    if (rule.type === 'rewrite' || rule.type === 'forbidden') {
       var basePath = rule.basePath || '/';
       if (!startsWith(uri, basePath)) {
         continue;
@@ -260,6 +273,9 @@ function findRedirect(uri, rules, headers) {
         conditional = conditional || conditions.length > 0;
         if (!matchesRefererConditions(conditions, headers || {})) {
           continue;
+        }
+        if (rule.type === 'forbidden') {
+          return { status: 403 };
         }
         return {
           status: rule.status,
