@@ -1074,9 +1074,6 @@ def _apply_default_cache_control(
         "IfMatch": current_etag,
         "MetadataDirective": "REPLACE",
         "TaggingDirective": "COPY",
-        # S3 Object Annotations are outside this feature's metadata contract.
-        # Excluding them also avoids requiring annotation-specific IAM actions.
-        "AnnotationDirective": "EXCLUDE",
         "Metadata": dict(current.get("Metadata") or {}),
         "CacheControl": default_cache_control,
     }
