@@ -201,7 +201,6 @@ CloudFrontのmanaged cache policy `CachingOptimized`は、minimum TTL 1秒、def
 - 同じkeyへのcopyではACLが`private`へリセットされます。S3 Object OwnershipのBucket owner enforcedとCloudFront OAC／OAIを前提とします。オブジェクトACLによる公開を維持する構成では、そのACLを安全に復元する処理を追加するまで有効化しないでください。
 - customer managed keyによるSSE-KMSオブジェクトでは、対象KMS keyに対する`kms:Decrypt`と`kms:GenerateDataKey`をLambda roleへ別途許可してください。汎用テンプレートはkey ARNを特定できないため、この権限を含めません。
 - S3 Object Lockのretention／legal holdがHEADで確認できるオブジェクトは自動的にskipします。SSE-Cはcustomer-provided encryption keyをcopy requestへ渡せないため対象外です。いずれもアップロード時に`Cache-Control`を指定してください。
-- S3 Object Annotationsは`AnnotationDirective=EXCLUDE`で除外するため、このmetadata更新では保持しません。Object Annotationsはchecksumとは別機能で、checksumはS3の通常のCopyObject動作で保持されます。Object Annotationsが必須のオブジェクトでは利用しないでください。
 - バージョニング有効バケットでは、同じkeyへのcopyが完全な新規versionを1つ作成し、非現行version分のストレージ料金も発生します。更新頻度と復旧要件に合わせてnoncurrent versionのLifecycleを設定してください。バージョニング停止中は現在のnull versionを置換し、version IDによる競合防止がないためETag条件によるbest-effort動作になります。
 
 CloudFront設定も現在値とETagを取得してから更新します。
@@ -475,7 +474,6 @@ Operational constraints:
 - Copying to the same key resets the ACL to `private`. The supported deployment assumes S3 Object Ownership set to Bucket owner enforced and CloudFront OAC/OAI access. Do not enable this workflow for legacy object-ACL publication until it is adapted to restore the intended ACL safely.
 - Objects encrypted with an SSE-KMS customer managed key require `kms:Decrypt` and `kms:GenerateDataKey` on that key for the Lambda role. The generic template cannot identify the key ARN and does not grant those permissions.
 - Objects with S3 Object Lock retention/legal-hold settings visible in HEAD are skipped automatically. SSE-C is unsupported because the copy request cannot provide the customer-provided encryption key. Set `Cache-Control` during upload for both cases.
-- S3 Object Annotations are deliberately excluded with `AnnotationDirective=EXCLUDE` and are not preserved by this metadata update. Object Annotations are distinct from checksums; checksums are preserved by the normal S3 CopyObject behavior. Do not use this workflow for objects that require Object Annotations.
 - In a versioned bucket, copying to the same key creates one additional full object version and incurs storage for the noncurrent version. Configure a noncurrent-version Lifecycle rule that matches the update rate and recovery requirements. With Versioning suspended, the copy replaces the current null version and concurrency protection is best-effort through ETag conditions because there is no version-ID guard.
 
 Retrieve the current Distribution configuration and ETag before editing it:

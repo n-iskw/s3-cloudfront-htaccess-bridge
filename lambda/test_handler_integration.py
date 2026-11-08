@@ -711,7 +711,6 @@ class CacheControlHandlerIntegrationTests(unittest.TestCase):
         self.assertEqual(copy_call["IfMatch"], '"etag-current"')
         self.assertEqual(copy_call["MetadataDirective"], "REPLACE")
         self.assertEqual(copy_call["TaggingDirective"], "COPY")
-        self.assertEqual(copy_call["AnnotationDirective"], "EXCLUDE")
         self.assertEqual(copy_call["CacheControl"], "public, max-age=60")
         self.assertEqual(copy_call["Metadata"], {"uploaded-by": "cms", "build": "42"})
         for field in (
